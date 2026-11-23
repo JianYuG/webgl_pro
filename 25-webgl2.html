@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>25 · WebGL2：VAO、GLSL ES 3.00 与内建实例化</title>
+<!--
+  ============================================================
+  第 25 课：WebGL2 迁移指南
+  ------------------------------------------------------------
+  WebGL2 不是新 API，而是「WebGL1 + 一堆曾经要扩展的东西 + 更好的 GLSL」。
+  本课把前面课程的老朋友搬进 WebGL2，逐项对照差异。
+
+  本课新知识点：
+    1. #version 300 es 必须是着色器第一行（无空行！）
+    2. attribute/varying -> in/out；gl_FragColor -> 自定义 out vec4
+    3. texture() 取代 texture2D；textureSize 等新内建
+    4. VAO（顶点数组对象）：把 attribute 配置打包成一个可复用状态
+    5. 实例化成为核心功能（不再需要 ANGLE_instanced_arrays 扩展）
+    6. gl_VertexID / gl_InstanceID：着色器里知道自己在画第几个
+
+  还有两个大头本课只点名不展开：
+    transform feedback（顶点着色器输出写回缓冲，GPU 粒子的钥匙）
+    uniform buffer object（跨程序共享 uniform 块）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  .fallback {
+    position: fixed; inset: 0; display: none; place-items: center;
+    color: #f0b429; font-size: 16px; text-align: center; padding: 24px;
+  }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 25</div>
+  <h1>WebGL2：VAO、GLSL ES 3.00 与内建实例化</h1>
+  <p>第 11 课的实例化波浪，改用 WebGL2 原生 API 重写：VAO 打包状态，GLSL 3.00 声明 in/out。</p>
+  <div class="tip">对比第 11 课：扩展检测没了，VAO 让 attribute 配置一次成型</div>
+</div>
+<div class="fallback" id="fallback">
+  当前环境不支持 WebGL2。<br>2026 年所有主流浏览器均已支持 WebGL2 ——
+  请换用新版 Chrome / Edge / Firefox。
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+/* ---- 差异 0：上下文名字变了，能力全面升级 ----
+ * webgl2 向下兼容 WebGL1 API：大部分 WebGL1 代码在 webgl2 上直接能跑。 */
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: true });
+if (!gl) {
+  document.getElementById('fallback').style.display = 'grid';
+  throw new Error('WebGL2 not supported');
+}
+
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ==================================================================
+ * 差异 1：GLSL ES 3.00 着色器
+ *   - 首行必须是 #version 300 es（之前不能有任何字符，包括空行）
+ *   - attribute -> in，varying -> out（顶点）/ in（片元）
+ *   - gl_FragColor 没了：自己声明 out 变量
+ *   - texture2D -> texture
+ *   - 新东西：gl_VertexID / gl_InstanceID、uint/整数纹理、switch…
+ * ================================================================== */
+const VERT_SRC = `#version 300 es
+  in vec3 aPos;               // 曾经的 attribute
+  in vec3 aNormal;
+  in vec2 aOffset;            // 实例属性：每个立方体的网格位置
+  in float aPhase;            // 实例属性：波浪相位
+
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform float uTime;
+
+  out vec3 vNormal;           // 曾经的 varying（顶点侧叫 out）
+  out vec3 vWorldPos;
+  out vec3 vTint;
+
+  void main() {
+    // gl_InstanceID：核心功能，不用任何扩展
+    float wave = sin(uTime * 2.2 - aPhase) * 0.45;
+    vec3 pos = aPos * 0.34 + vec3(aOffset.x, wave, aOffset.y);
+
+    vWorldPos = pos;
+    vNormal = aNormal;
+    // 用波浪高度调色
+    vTint = mix(vec3(0.13, 0.42, 0.75), vec3(0.30, 0.85, 0.60), wave * 0.9 + 0.5);
+
+    gl_Position = uProj * uView * vec4(pos, 1.0);
+  }
+`;
+
+const FRAG_SRC = `#version 300 es
+  precision highp float;
+
+  in vec3 vNormal;
+  in vec3 vWorldPos;
+  in vec3 vTint;
+
+  uniform vec3 uLightDir;
+  uniform vec3 uEye;
+
+  out vec4 outColor;          // 曾经的 gl_FragColor
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uLightDir);
+    vec3 V = normalize(uEye - vWorldPos);
+    vec3 H = normalize(L + V);
+    float diff = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), 40.0);
+    vec3 color = vTint * (0.16 + 0.84 * diff) + vec3(spec * 0.35);
+    color = pow(color, vec3(1.0 / 2.2));
+    outColor = vec4(color, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 几何 + VAO
+ * ----------------------------------------------------------------
+ * 差异 2：VAO 把「绑哪些缓冲、每个 attribute 怎么读」打包成一个对象。
+ * 以前切换物体要重复 6~8 行 bind/pointer，现在一行 bindVertexArray。
+ * 引擎里通常「每个 Mesh 一个 VAO，初始化时全部建好」。
+ * ================================================================== */
+const cubePos = new Float32Array([
+  -1,-1, 1,  1,-1, 1,  1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,  1,-1,-1,  1, 1,-1,  -1, 1,-1
+]);
+const cubeNor = new Float32Array([
+   0, 0, 1,  0, 0, 1,  0, 0, 1,  0, 0, 1,
+   0, 0,-1,  0, 0,-1,  0, 0,-1,  0, 0,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,   1,5,6, 1,6,2,
+  4,0,3, 4,3,7,   3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+
+const GRID = 40;
+const instances = GRID * GRID;
+const offsets = new Float32Array(instances * 2);
+const phases  = new Float32Array(instances);
+let k = 0;
+for (let z = 0; z < GRID; z++) {
+  for (let x = 0; x < GRID; x++) {
+    offsets[k * 2]     = (x - GRID / 2 + 0.5) * 0.5;
+    offsets[k * 2 + 1] = (z - GRID / 2 + 0.5) * 0.5;
+    // 相位由到中心距离决定 -> 同心圆波
+    phases[k] = Math.hypot(x - GRID/2, z - GRID/2) * 0.55;
+    k++;
+  }
+}
+
+function makeBuf(target, data, usage) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, usage || gl.STATIC_DRAW);
+  return b;
+}
+const posBuf = makeBuf(gl.ARRAY_BUFFER, cubePos);
+const norBuf = makeBuf(gl.ARRAY_BUFFER, cubeNor);
+const idxBuf = makeBuf(gl.ELEMENT_ARRAY_BUFFER, cubeIdx);
+const offBuf = makeBuf(gl.ARRAY_BUFFER, offsets);
+const phaBuf = makeBuf(gl.ARRAY_BUFFER, phases);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);          // 从这一刻起，所有 attribute 配置都记进 vao
+
+const aPos = gl.getAttribLocation(program, 'aPos');
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+const aNor = gl.getAttribLocation(program, 'aNormal');
+gl.bindBuffer(gl.ARRAY_BUFFER, norBuf);
+gl.enableVertexAttribArray(aNor);
+gl.vertexAttribPointer(aNor, 3, gl.FLOAT, false, 0, 0);
+
+/* 差异 3：实例属性也是 attribute，vertexAttribDivisor 是核心 API。
+ * divisor=1 表示每画一个实例前进一格。 */
+const aOffset = gl.getAttribLocation(program, 'aOffset');
+gl.bindBuffer(gl.ARRAY_BUFFER, offBuf);
+gl.enableVertexAttribArray(aOffset);
+gl.vertexAttribPointer(aOffset, 2, gl.FLOAT, false, 0, 0);
+gl.vertexAttribDivisor(aOffset, 1);
+
+const aPhase = gl.getAttribLocation(program, 'aPhase');
+gl.bindBuffer(gl.ARRAY_BUFFER, phaBuf);
+gl.enableVertexAttribArray(aPhase);
+gl.vertexAttribPointer(aPhase, 1, gl.FLOAT, false, 0, 0);
+gl.vertexAttribDivisor(aPhase, 1);
+
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bindVertexArray(null);         // 配置完毕，收起来
+
+const uView = gl.getUniformLocation(program, 'uView');
+const uProj = gl.getUniformLocation(program, 'uProj');
+const uTime = gl.getUniformLocation(program, 'uTime');
+const uLight = gl.getUniformLocation(program, 'uLightDir');
+const uEye  = gl.getUniformLocation(program, 'uEye');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.03, 0.04, 0.06, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(program);
+  gl.uniformMatrix4fv(uView, false, M4.lookAt([7.5, 6.5, 9.0], [0, 0, 0], [0, 1, 0]));
+  gl.uniformMatrix4fv(uProj, false, M4.perspective(50 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100));
+  gl.uniform1f(uTime, t);
+  gl.uniform3f(uLight, 0.45, 0.9, 0.4);
+  gl.uniform3f(uEye, 7.5, 6.5, 9.0);
+
+  /* 一次 draw call 画 1600 个立方体 —— 和第 11 课一样，
+   * 但这次没有扩展检测、没有 fallback 分支。 */
+  gl.bindVertexArray(vao);        // 一行恢复全部 attribute 状态
+  gl.drawElementsInstanced(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0, instances);
+  gl.bindVertexArray(null);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * WebGL2 还值得学的（按实用性排序）：
+ *   transform feedback —— 顶点着色器输出写回缓冲区：GPU 粒子/布料的钥匙
+ *   uniform block / UBO —— 一块 uniform 多个程序共享，切换材质免重传
+ *   3D 纹理 & 纹理数组 —— 体渲染（医学CT）、图集数组的正解
+ *   R/G/B 整数纹理与 instanced 整数属性 —— ID 拾取不用再编码进 RGBA
+ *   多渲染目标 MRT —— 延迟渲染（GBuffer）的基础
+ *   query 对象 —— occlusion query / 计时（EXT_disjoint_timer_query_webgl2）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · 相机与交互：lookAt 与轨道控制</title>
+<!--
+  ============================================================
+  第 10 课：相机
+  ------------------------------------------------------------
+  3D 场景里没有「相机」这个硬件，它只是视图矩阵的一次坐标变换：
+  把整个世界挪动到「相机在原点、朝 -Z 看」的位置。
+
+  本课新知识点：
+    1. 轨道相机（Orbit Camera）的三个参数：方位角、俯仰角、距离
+    2. 鼠标拖拽 / 滚轮 / 触摸交互（Pointer Events 一套代码通吃）
+    3. 距离衰减（雾）—— 帮助眼睛判断深度的最强线索
+    4. 为什么极角必须夹住，不能让相机顶到正上方
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 10</div>
+  <h1>相机与交互：lookAt 与轨道控制</h1>
+  <p>343 个立方体的几何完全一样，只是模型矩阵不同 —— 这是「实例化」的动机。</p>
+  <div class="tip">拖拽旋转 · 滚轮缩放 · 双击复位</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（同前，略）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+
+    const z = norm(sub(eye, center));   // 相机坐标系 +Z = 从目标指向相机（相机往后退的方向）
+    const x = norm(cross(up, z));       // +X = up × z
+    const y = cross(z, x);              // +Y = z × x（已经是单位向量）
+
+    // 平移分量在第四列：把世界原点搬到相机坐标系里
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ------------------------------------------------------------------
+ * 着色器
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec3 aPos;
+
+  uniform mat4 uMvp;
+  uniform mat4 uModel;
+  uniform vec3 uCameraPos;
+
+  varying vec3  vColor;
+  varying float vFade;
+
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    gl_Position = uMvp * vec4(aPos, 1.0);
+
+    vColor = normalize(aPos) * 0.5 + 0.5;   // 用局部坐标上色，便于识别每个立方体的朝向
+    // 距相机 22 个单位以外完全隐入背景
+    vFade = 1.0 - clamp(length(world.xyz - uCameraPos) / 22.0, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec3  vColor;
+  varying float vFade;
+
+  void main() {
+    gl_FragColor = vec4(vColor * (0.15 + 0.85 * vFade), 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ------------------------------------------------------------------
+ * 一个单位立方体：8 顶点 + 36 索引
+ * ------------------------------------------------------------------ */
+const cubePos = new Float32Array([
+  -1,-1, 1,   1,-1, 1,   1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,   1,-1,-1,   1, 1,-1,  -1, 1,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,
+  1,5,6, 1,6,2,   4,0,3, 4,3,7,
+  3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, cubePos, gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeIdx, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+
+const uMvpLoc       = gl.getUniformLocation(program, 'uMvp');
+const uModelLoc     = gl.getUniformLocation(program, 'uModel');
+const uCameraPosLoc = gl.getUniformLocation(program, 'uCameraPos');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+/* ==================================================================
+ * 轨道相机
+ * ----------------------------------------------------------------
+ * 用球坐标而不是直接存 xyz，是为了让「绕目标旋转」变成两个角度的加减。
+ *   azimuth  水平方位角（绕 Y 轴）
+ *   polar    俯仰角，0 = 正上方看下来，π = 正下方看上来
+ *   distance 到目标的距离
+ *
+ * polar 必须夹在 (0, π) 开区间内：一旦到 0 或 π，
+ * 视线方向与 up=[0,1,0] 平行，lookAt 里的 cross(up, z) 退化成零向量，
+ * 归一化后是 NaN —— 画面直接变黑或翻转。
+ * ================================================================== */
+const camera = { target: [0, 0, 0], azimuth: 0.7, polar: Math.PI * 0.34, distance: 20 };
+const DEFAULT_CAMERA = { target: [0, 0, 0], azimuth: 0.7, polar: Math.PI * 0.34, distance: 20 };
+
+function cameraPosition() {
+  const { azimuth, polar, distance, target } = camera;
+  const sp = Math.sin(polar), cp = Math.cos(polar);
+  return [
+    target[0] + distance * sp * Math.cos(azimuth),
+    target[1] + distance * cp,
+    target[2] + distance * sp * Math.sin(azimuth)
+  ];
+}
+
+/* ---- 交互 ---- */
+let dragging = false, lastX = 0, lastY = 0;
+
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  lastX = e.clientX; lastY = e.clientY;
+  canvas.classList.add('dragging');
+  canvas.setPointerCapture(e.pointerId);   // 指针移出画布外也不丢事件
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+
+  camera.azimuth -= dx * 0.006;
+  camera.polar   -= dy * 0.006;
+  camera.polar = Math.min(Math.PI * 0.92, Math.max(Math.PI * 0.08, camera.polar));
+});
+
+function endDrag(e) {
+  dragging = false;
+  canvas.classList.remove('dragging');
+  if (e && e.pointerId !== undefined) canvas.releasePointerCapture?.(e.pointerId);
+}
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  // 指数缩放：无论当前远近，每一格滚动的「手感」都一样
+  camera.distance = Math.min(45, Math.max(4, camera.distance * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
+
+canvas.addEventListener('dblclick', () => Object.assign(camera, DEFAULT_CAMERA));
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+/* ---- 场景：7×7×7 的立方矩阵 ---- */
+const N = 7, SPACING = 1.5;
+const cubes = [];
+for (let x = 0; x < N; x++)
+  for (let y = 0; y < N; y++)
+    for (let z = 0; z < N; z++)
+      cubes.push([(x - 3) * SPACING, (y - 3) * SPACING, (z - 3) * SPACING]);
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.035, 0.042, 0.062, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(55 * Math.PI / 180, aspect, 0.1, 200);
+  const eye = cameraPosition();
+  const view = M4.lookAt(eye, camera.target, [0, 1, 0]);
+  const viewProj = M4.mul(proj, view);      // 343 个对象共享，只算一次
+
+  gl.uniform3fv(uCameraPosLoc, eye);
+
+  for (let i = 0; i < cubes.length; i++) {
+    const [x, y, z] = cubes[i];
+    const wobble = 0.06 * Math.sin(t * 1.5 + x * 0.5 + z * 0.4);
+
+    const model = M4.chain(
+      M4.translate(x, y + wobble, z),
+      M4.rotateY(t * 0.3 + i * 0.01),
+      M4.scale(0.55, 0.55, 0.55)
+    );
+
+    gl.uniformMatrix4fv(uModelLoc, false, model);
+    gl.uniformMatrix4fv(uMvpLoc, false, M4.mul(viewProj, model));
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 343 次 draw call 对现代 GPU 不算什么，但如果涨到 3 万个，
+ * CPU 侧每帧要做的矩阵乘法和状态切换就会成为瓶颈。
+ * 第 11 课用一次 draw call 画完所有立方体。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

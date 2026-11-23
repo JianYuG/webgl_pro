@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · 法线贴图：切线空间与 TBN</title>
+<!--
+  ============================================================
+  第 16 课：法线贴图（Normal Mapping）
+  ------------------------------------------------------------
+  第 9 课的光照用「几何法线」，一个平面只能有一种朝向。
+  法线贴图把逐像素的法线存在一张 RGB 纹理里（R/G/B 编码 x/y/z），
+  一个平面就能呈现出砖缝、凹凸、锈蚀等细节 —— 三角形数量不变。
+
+  本课新知识点：
+    1. 法线贴图的数据格式：法线 (x,y,z) ∈ [-1,1] 映射到颜色 [0,255]
+    2. 切线空间（Tangent Space）：为什么法线要「相对于表面」存
+    3. TBN 矩阵：Tangent / Bitangent / Normal 三根轴构成局部坐标系
+    4. 逐顶点切线 attribute 与每面独立的切线（立方体 6 个面）
+    5. 程序化生成法线贴图（高度图 -> 有限差分 -> 法线）
+
+  按空格切换「法线贴图 开/关」，对比平面细节的消失。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+  .badge { position: fixed; right: 18px; top: 18px; font: 600 12px/1 ui-monospace, Consolas, monospace;
+           color: #0b0e14; background: #7ee787; padding: 8px 12px; border-radius: 999px; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 16</div>
+  <h1>法线贴图：切线空间与 TBN</h1>
+  <p>砖块法线贴图由代码生成（高度图 → 有限差分 → 法线）。地面和立方体都是平面几何，细节全部来自贴图。</p>
+  <div class="tip">按空格切换法线贴图 · 光源绕场景旋转观察凹凸变化</div>
+</div>
+<div class="badge" id="badge">NORMAP ON</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 精简矩阵库（normalMat3Of：本课模型只含旋转/等比缩放）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  },
+  normalMat3Of(m) {
+    return new Float32Array([m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 着色器
+ * ----------------------------------------------------------------
+ * 核心思路：
+ *   法线贴图里存的法线是「切线空间」的 —— 即假定表面朝向是 (0,0,1)，
+ *   砖缝凹凸都相对于这个基准表达。采样后要把它变换到世界空间再光照。
+ *   负责这个变换的就是 TBN 矩阵：
+ *     T = 切线（贴图 u 方向在世界空间的走向）
+ *     B = 副切线（贴图 v 方向）
+ *     N = 几何法线
+ *   worldNormal = T * n.x + B * n.y + N * n.z   （TBN 当作 3 列用）
+ * ================================================================== */
+const VERT_SRC = `
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  attribute vec3 aTangent;    // 每个顶点自带切线（物体空间）
+  attribute vec2 aUv;
+
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform mat3 uNormalMat;
+
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  varying mat3 vTbn;          // GLSL ES 1.0 允许 mat3 varying
+
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos = world.xyz;
+    vUv = aUv;
+
+    // 切线跟随模型旋转：用与法线同样的规则变换（旋转矩阵下直接乘即可）
+    vec3 N = normalize(uNormalMat * aNormal);
+    vec3 T = normalize(uNormalMat * aTangent);
+    // 副切线由叉积得到，保证三轴互相垂直（右手系，符号约定略）
+    vec3 B = normalize(cross(N, T));
+
+    // 列主序：第 0 列是 T，第 1 列是 B，第 2 列是 N
+    vTbn = mat3(T, B, N);
+
+    gl_Position = uProj * uView * world;
+  }
+`;
+
+const FRAG_SRC = `
+  precision highp float;
+
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  varying mat3 vTbn;
+
+  uniform sampler2D uNormalMap;
+  uniform sampler2D uColorMap;    // 漫反射颜色也来自同一套程序化砖纹
+  uniform vec3  uLightPos;
+  uniform vec3  uViewPos;
+  uniform float uUseNormalMap;    // 0/1 教学开关
+
+  void main() {
+    // 1) 采样法线贴图：颜色 [0,1] -> 法线 [-1,1]
+    vec3 mapN = texture2D(uNormalMap, vUv).xyz * 2.0 - 1.0;
+    // 保险：贴图压缩/插值可能让长度偏离 1
+    mapN = normalize(mapN);
+
+    // 2) TBN 把切线空间法线变换到世界空间
+    vec3 N = normalize(vTbn * mix(vec3(0.0, 0.0, 1.0), mapN, uUseNormalMap));
+
+    // 3) Blinn-Phong（和第 9 课一样，只是 N 换成了扰动后的）
+    vec3 L = normalize(uLightPos - vWorldPos);
+    vec3 V = normalize(uViewPos - vWorldPos);
+    vec3 H = normalize(L + V);
+
+    float diff = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), 48.0) * step(0.0001, diff);
+
+    vec3 base = texture2D(uColorMap, vUv).rgb;
+    vec3 color = base * (0.14 + 0.86 * diff)
+               + vec3(1.0) * spec * 0.6;
+
+    color = pow(color, vec3(1.0/2.2));
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 程序化生成法线贴图
+ * ----------------------------------------------------------------
+ * 流程：高度图（砖缝凹陷）-> 有限差分求梯度 -> 法线 = normalize(-dx, -dy, 1)
+ * 颜色里 R=x, G=y, B=z。B 通道接近 255（法线大多朝外）是法线贴图的标志。
+ * ================================================================== */
+function makeNormalMaps(size) {
+  // -- 高度图：砖块高、砖缝低，边缘用 smoothstep 揉出倒角 --
+  const brickW = size / 4, brickH = size / 8, mortar = size / 42;
+  const height = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const row = Math.floor(y / brickH);
+      const offset = (row % 2) * brickW * 0.5;          // 砖缝错位排列
+      const lx = ((x + offset) % brickW) / 1;           // 砖内局部坐标
+      const ly = y % brickH;
+      const edge = Math.min(lx, brickW - lx, ly, brickH - ly);
+      // 距砖边越近越矮；mortar 内为 0
+      const t = Math.min(edge / mortar, 1);
+      height[y * size + x] = t * t * (3 - 2 * t);       // smoothstep 倒角
+    }
+  }
+  // -- 有限差分 -> 法线（环形采样，保证无缝平铺）--
+  const K = 3.2;   // 梯度强度：越大凹凸越夸张
+  const normCv = document.createElement('canvas');
+  const colCv  = document.createElement('canvas');
+  normCv.width = normCv.height = size;
+  colCv.width  = colCv.height  = size;
+  const nCtx = normCv.getContext('2d');
+  const cCtx = colCv.getContext('2d');
+  const nImg = nCtx.createImageData(size, size);
+  const cImg = cCtx.createImageData(size, size);
+  const at = (x, y) => height[((y + size) % size) * size + ((x + size) % size)];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = (at(x + 1, y) - at(x - 1, y)) * K;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * K;
+      const len = Math.hypot(dx, dy, 1);
+      const i = (y * size + x) * 4;
+      nImg.data[i]     = (-dx / len * 0.5 + 0.5) * 255;
+      nImg.data[i + 1] = (-dy / len * 0.5 + 0.5) * 255;
+      nImg.data[i + 2] = ( 1 / len * 0.5 + 0.5) * 255;
+      nImg.data[i + 3] = 255;
+      // 漫反射贴图：砖面红棕、砖缝深灰
+      const h = at(x, y);
+      cImg.data[i]     = 120 + 105 * h;
+      cImg.data[i + 1] =  62 +  50 * h;
+      cImg.data[i + 2] =  48 +  40 * h;
+      cImg.data[i + 3] = 255;
+    }
+  }
+  nCtx.putImageData(nImg, 0, 0);
+  cCtx.putImageData(cImg, 0, 0);
+  return { normCv, colCv };
+}
+
+function uploadTexture(cv, repeat) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.generateMipmap(gl.TEXTURE_2D);            // 256x256 是 POT，可以 mipmap
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const wrap = repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  return t;
+}
+
+const { normCv, colCv } = makeNormalMaps(256);
+const normalTex = uploadTexture(normCv, true);
+const colorTex  = uploadTexture(colCv, true);
+
+/* ==================================================================
+ * 几何
+ * ----------------------------------------------------------------
+ * 地面：水平大面片，切线沿 +X（贴图 u 方向）。
+ * 立方体：6 个面各自独立法线和切线 —— 切线是「贴图坐标系」的属性，
+ *         贴图怎么铺，切线就怎么定，没有全局统一的切线。
+ * ================================================================== */
+function buildGeometry() {
+  const pos = [], nor = [], tan = [], uv = [], idx = [];
+  let base = 0;
+
+  function addFace(center, n, t, b, size, uvScale) {
+    // 4 个角 = 中心 ± t·size ± b·size；uv 随之铺开（uvScale 控制平铺次数）
+    const s = uvScale || 1;
+    const corners = [
+      [center, -1, -1], [center, 1, -1], [center, 1, 1], [center, -1, 1]
+    ];
+    const uvs = [[0,0], [1,0], [1,1], [0,1]];
+    corners.forEach(([c, su, sv], i) => {
+      pos.push(
+        c[0] + (t[0]*su + b[0]*sv) * size,
+        c[1] + (t[1]*su + b[1]*sv) * size,
+        c[2] + (t[2]*su + b[2]*sv) * size
+      );
+      nor.push(n[0], n[1], n[2]);
+      tan.push(t[0], t[1], t[2]);
+      uv.push(uvs[i][0] * s, uvs[i][1] * s);
+    });
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+    base += 4;
+  }
+
+  // 地面（y=0，法线 +Y，切线 +X，副切线 = n×t = (0,0,-1)）；UV 平铺 3x3
+  addFace([0, 0, 0], [0, 1, 0], [1, 0, 0], [0, 0, -1], 5.0, 3.0);
+
+  // 立方体 6 面
+  const faces = [
+    { n: [0, 0, 1],  t: [1, 0, 0] },
+    { n: [0, 0, -1], t: [-1, 0, 0] },
+    { n: [1, 0, 0],  t: [0, 0, -1] },
+    { n: [-1, 0, 0], t: [0, 0, 1] },
+    { n: [0, 1, 0],  t: [1, 0, 0] },
+    { n: [0, -1, 0], t: [1, 0, 0] }
+  ];
+  for (const f of faces) {
+    const b = [
+      f.n[1]*f.t[2] - f.n[2]*f.t[1],
+      f.n[2]*f.t[0] - f.n[0]*f.t[2],
+      f.n[0]*f.t[1] - f.n[1]*f.t[0]
+    ];
+    addFace([f.n[0], f.n[1], f.n[2]], f.n, f.t, b, 1.0);
+  }
+
+  return {
+    pos: new Float32Array(pos), nor: new Float32Array(nor),
+    tan: new Float32Array(tan), uv: new Float32Array(uv),
+    idx: new Uint16Array(idx)
+  };
+}
+
+const geo = buildGeometry();
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+buf(gl.ARRAY_BUFFER, geo.pos);
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, geo.nor);
+const aNorLoc = gl.getAttribLocation(program, 'aNormal');
+gl.enableVertexAttribArray(aNorLoc);
+gl.vertexAttribPointer(aNorLoc, 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, geo.tan);
+const aTanLoc = gl.getAttribLocation(program, 'aTangent');
+gl.enableVertexAttribArray(aTanLoc);
+gl.vertexAttribPointer(aTanLoc, 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, geo.uv);
+const aUvLoc = gl.getAttribLocation(program, 'aUv');
+gl.enableVertexAttribArray(aUvLoc);
+gl.vertexAttribPointer(aUvLoc, 2, gl.FLOAT, false, 0, 0);
+const idxBuf = buf(gl.ELEMENT_ARRAY_BUFFER, geo.idx);
+
+const u = n => gl.getUniformLocation(program, n);
+const uModel = u('uModel'), uView = u('uView'), uProj = u('uProj');
+const uNormalMat = u('uNormalMat'), uLightPos = u('uLightPos');
+const uViewPos = u('uViewPos'), uUseNormalMap = u('uUseNormalMap');
+
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, normalTex);
+gl.uniform1i(u('uNormalMap'), 0);
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D, colorTex);
+gl.uniform1i(u('uColorMap'), 1);
+
+let useNormalMap = true;
+const badge = document.getElementById('badge');
+window.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  useNormalMap = !useNormalMap;
+  badge.textContent = useNormalMap ? 'NORMAP ON' : 'NORMAP OFF';
+  badge.style.background = useNormalMap ? '#7ee787' : '#f0b429';
+});
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+const EYE = [3.4, 2.6, 5.2];
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.04, 0.05, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.uniformMatrix4fv(uView, false, M4.lookAt(EYE, [0, 0.6, 0], [0, 1, 0]));
+  gl.uniformMatrix4fv(uProj, false, M4.perspective(50 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100));
+  gl.uniform3fv(uViewPos, EYE);
+  gl.uniform1f(uUseNormalMap, useNormalMap ? 1 : 0);
+
+  const lightPos = [Math.cos(t * 0.7) * 3.4, 2.6 + Math.sin(t * 1.1) * 0.7, Math.sin(t * 0.7) * 3.4];
+  gl.uniform3fv(uLightPos, lightPos);
+
+  // 地面
+  const groundModel = M4.identity();
+  gl.uniformMatrix4fv(uModel, false, groundModel);
+  gl.uniformMatrix3fv(uNormalMat, false, M4.normalMat3Of(groundModel));
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+  // 立方体：绕 Y 慢转，观察切线跟着模型旋转、砖纹在六个面上方向各异
+  const cubeModel = M4.chain(
+    M4.translate(0, 1.7, 0),
+    M4.rotateY(t * 0.45),
+    M4.rotateX(Math.sin(t * 0.3) * 0.25),
+    M4.scale(1.1, 1.1, 1.1)
+  );
+  gl.uniformMatrix4fv(uModel, false, cubeModel);
+  gl.uniformMatrix3fv(uNormalMat, false, M4.normalMat3Of(cubeModel));
+  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 6 * 2);   // 跳过地面的 6 个索引
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 进阶话题：
+ *   TBN 的严格推导 —— 用相邻顶点的 UV 差和位置差解 2x2 方程组
+ *     （本课为了聚焦用「规则几何 + 手工切线」，导入模型时必须用推导版）
+ *   副切线的手性（handedness）—— mikktspace 约定，w 分量决定 B 的方向
+ *   视差贴图（Parallax Mapping）—— 在法线贴图基础上再偏移 UV，有高度视错觉
+ *   SDF/高度图混合方案、纹理爆炸问题（texture bombing）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

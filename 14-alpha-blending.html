@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 · 透明与混合：alpha blending 与排序</title>
+<!--
+  ============================================================
+  第 14 课：透明与混合（Alpha Blending）
+  ------------------------------------------------------------
+  深度测试只会回答「谁在前」，但半透明物体需要的是「前后叠加」，
+  这就是混合（Blending）要干的事 —— 把新像素和旧像素按 alpha 混在一起。
+
+  本课新知识点：
+    1. gl.enable(gl.BLEND) 与 blendFunc 的数学：src * S + dst * D
+    2. 为什么要给「透明物体」关掉深度写入 depthMask(false)
+    3. 画家算法：透明物体必须从后往前画（不透明物体随便）
+    4. 预乘 alpha（premultiplied alpha）是什么、什么时候踩坑
+    5. 程序化生成带 alpha 通道的纹理（radial gradient）
+
+  按空格切换「排序 开/关」，直观看到不排序时的错误叠加。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+  .badge { position: fixed; right: 18px; top: 18px; font: 600 12px/1 ui-monospace, Consolas, monospace;
+           color: #0b0e14; background: #7ee787; padding: 8px 12px; border-radius: 999px; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 14</div>
+  <h1>透明与混合：alpha blending 与排序</h1>
+  <p>5 张半透明光斑悬浮在场景中。不透明地面先画，透明物体后画、关深度写入、按远近排序。</p>
+  <div class="tip">按空格切换排序 —— 关掉后光斑前后关系会画错</div>
+</div>
+<div class="badge" id="badge">SORT ON</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true, premultipliedAlpha: false });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 精简版矩阵库（只留本课需要的）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+const VERT_SRC = `
+  attribute vec3 aPos;      // 共用几何：地面和光斑都用单位面片
+  attribute vec2 aUv;
+
+  uniform mat4 uMvp;
+
+  varying vec2 vUv;
+
+  void main() {
+    vUv = aUv;
+    gl_Position = uMvp * vec4(aPos, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+
+  varying vec2 vUv;
+
+  uniform sampler2D uTex;
+  uniform vec3  uTint;      // 光斑颜色
+  uniform float uAlphaMul;  // 地面传 1.0，光斑传 0.55 之类
+  uniform float uIsOpaque;  // 教学开关：光斑用假的不透明度做对比
+
+  void main() {
+    vec4 tex = texture2D(uTex, vUv);
+    // alpha = 纹理 alpha * 全局系数。混合公式在 JS 侧配置，这里只负责输出。
+    gl_FragColor = vec4(tex.rgb * uTint, tex.a * uAlphaMul);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 带透明通道的程序化纹理（64x64 径向渐变光斑）
+ * ----------------------------------------------------------------
+ * canvas 2D 的 alpha 通道会原样进入纹理。
+ * 注意 premultipliedAlpha：canvas 导出的像素默认是「预乘 alpha」的
+ * （即 RGB 已经乘过 A）。画布 getContext 时设置 premultipliedAlpha:false
+ * + 上传时 UNPACK_PREMULTIPLY_ALPHA_WEBGL=false，这里才按「直通 alpha」
+ * 处理。两种约定混用是透明贴图最常见的踩坑点。
+ * ================================================================== */
+function makeGlowTexture(size = 64) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  g.addColorStop(0.0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.4, 'rgba(255,255,255,0.85)');
+  g.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return cv;
+}
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, makeGlowTexture());
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);  // NPOT: 不能 mipmap
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+/* ==================================================================
+ * 几何：单位面片（中心在原点、边长 2 的 XZ 平面）
+ * 地面用 scale 放大，光斑用 scale 缩小 —— 复用同一份顶点。
+ * ================================================================== */
+const quadPos = new Float32Array([
+  -1, 0, -1,   1, 0, -1,   1, 0,  1,  -1, 0,  1    // y=0 的水平面片
+]);
+const quadUv  = new Float32Array([0,0, 1,0, 1,1, 0,1]);
+const quadIdx = new Uint16Array([0,2,1, 0,3,2]);   // 绕序：从 +Y 上方看为逆时针（正面）
+
+function makeBuf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+const posBuf = makeBuf(gl.ARRAY_BUFFER, quadPos);
+const uvBuf  = makeBuf(gl.ARRAY_BUFFER, quadUv);
+const idxBuf = makeBuf(gl.ELEMENT_ARRAY_BUFFER, quadIdx);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+const aUvLoc  = gl.getAttribLocation(program, 'aUv');
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+gl.enableVertexAttribArray(aUvLoc);
+gl.vertexAttribPointer(aUvLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uMvpLoc     = gl.getUniformLocation(program, 'uMvp');
+const uTintLoc    = gl.getUniformLocation(program, 'uTint');
+const uAlphaMulLoc= gl.getUniformLocation(program, 'uAlphaMul');
+
+const EYE = [0, 2.6, 6.4];
+const VIEW = M4.lookAt(EYE, [0, 0.4, 0], [0, 1, 0]);
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+/* ------------------------------------------------------------------
+ * 混合配置（核心三行）：
+ *   gl.enable(gl.BLEND)
+ *   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+ *   gl.depthMask(false)
+ *
+ * blendFunc 数学：最终色 = src.rgb * SRC + dst.rgb * DST
+ *   SRC_ALPHA / ONE_MINUS_SRC_ALPHA 就是经典的「标准透明」：
+ *   alpha=1 完全覆盖，alpha=0 完全透出背景，0.5 对半混。
+ *
+ * 为什么透明物体要 depthMask(false)（只测不写深度）？
+ *   半透明物体互相重叠时，「后画的挡住先画的」这个深度规则不成立 ——
+ *   应该看到的是颜色叠加。如果还写深度，先画的光斑会把后面画的光斑
+ *   挡掉，变成奇怪的「透明但有遮挡」。
+ *   深度测试仍然保留：这样透明物体依然会被不透明地面正确遮挡。
+ * ------------------------------------------------------------------ */
+const EYE_ANIM = [0, 2.6, 6.4];
+
+/* 5 个光斑：位置随时间漂移 */
+const blobs = [
+  { hue: [0.95, 0.35, 0.35], phase: 0.0, r: 1.6, y: 0.8 },
+  { hue: [0.35, 0.75, 0.95], phase: 1.3, r: 1.3, y: 1.5 },
+  { hue: [0.95, 0.85, 0.35], phase: 2.6, r: 1.0, y: 0.4 },
+  { hue: [0.60, 0.40, 0.95], phase: 3.9, r: 1.4, y: 1.1 },
+  { hue: [0.40, 0.95, 0.55], phase: 5.2, r: 0.8, y: 1.9 }
+];
+
+/* 排序开关：按「到相机距离」从远到近排序 */
+let sortEnabled = true;
+const badge = document.getElementById('badge');
+window.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  sortEnabled = !sortEnabled;
+  badge.textContent = sortEnabled ? 'SORT ON' : 'SORT OFF';
+  badge.style.background = sortEnabled ? '#7ee787' : '#f0b429';
+});
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.04, 0.05, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(50 * Math.PI / 180, aspect, 0.1, 100);
+
+  const view = M4.lookAt(EYE_ANIM, [0, 0.5, 0], [0, 1, 0]);
+
+  /* ---------------- Pass 1：不透明（地面） ----------------
+   * 不透明物体不需要 BLEND，先画，正常写深度。
+   * 它们之间的顺序无所谓 —— 深度测试会解决。 */
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+
+  gl.uniform3f(uTintLoc, 0.16, 0.20, 0.28);
+  gl.uniform1f(uAlphaMulLoc, 1.0);
+
+  const groundModel = M4.scale(9, 1, 9);
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, groundModel));
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+  /* ---------------- Pass 2：透明（光斑） ---------------- */
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);          // 关键：透明物体只测深度、不写深度
+
+  // 计算每个光斑当前位置和到相机距离
+  for (const b of blobs) {
+    b.x = Math.cos(t * 0.5 + b.phase) * b.r;
+    b.z = Math.sin(t * 0.4 + b.phase * 1.7) * b.r;
+    const dx = b.x - EYE_ANIM[0], dy = b.y - EYE_ANIM[1], dz = b.z - EYE_ANIM[2];
+    b.dist = Math.hypot(dx, dy, dz);
+  }
+  // 画家算法：从远到近排序。远的先画，近的后画「盖」上去。
+  // 注意：透视投影下「深度值大小」不等于「距离」，用距离排序才对。
+  if (sortEnabled) blobs.sort((a, b) => b.dist - a.dist);
+
+  for (const b of blobs) {
+    const model = M4.chain(
+      M4.translate(b.x, b.y, b.z),
+      M4.scale(1.1, 1, 1.1)
+    );
+    gl.uniform3fv(uTintLoc, b.hue);
+    gl.uniform1f(uAlphaMulLoc, 0.55);
+    gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+
+  gl.depthMask(true);           // 还原，给下一帧 Pass 1 用
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 混合相关的进阶知识（本课代码之外，值得知道）：
+ *
+ * 1. 预乘 alpha（premultiplied）：
+ *      直通  (straight):  存 (r, g, b, a)，混合用 SRC_ALPHA
+ *      预乘  (premultiplied): 存 (r*a, g*a, b*a, a)，混合用 ONE, ONE_MINUS_SRC_ALPHA
+ *    预乘的好处：插值不会出现「黑边」；图片加载 API 默认按预乘处理，
+ *    半透明 PNG 出黑边多半是这里出了问题。
+ *
+ * 2. 加色混合 blendFunc(ONE, ONE)：粒子/火焰/光效常用，第 18 课用。
+ *
+ * 3. 常见排序 hack：
+ *    - 网格化世界（Minecraft）：每个方块其实是不透明的
+ *    - 把一个透明网格拆成凸块分别排序
+ *    - 接受近似，用 depth peeling / linked list（OIT）等高级技术
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

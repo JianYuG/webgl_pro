@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · 顶点色插值：varying 与交错缓冲区</title>
+<!--
+  ============================================================
+  第 4 课：GPU 最擅长的事 —— 插值
+  ------------------------------------------------------------
+  本课新知识点：
+    1. varying：顶点着色器算出、片元着色器接收的「插值变量」
+    2. 交错缓冲区（interleaved buffer）+ stride/offset 的正确算法
+    3. 一个三角形只有 3 个顶点，为什么能画出平滑渐变
+       —— 因为光栅化阶段 GPU 会按重心坐标对 varying 线性插值
+
+  这个机制是后面所有「光滑表面」的基础：
+  法线插值让立方体看起来像球，UV 插值让纹理贴上去不撕裂。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 04</div>
+  <h1>顶点色插值：varying 与交错缓冲区</h1>
+  <p>3 个顶点各带一个颜色，中间的渐变是 GPU 在光栅化时自动插出来的，JS 一行都没写。</p>
+  <div class="tip">把 varying 改成 flat 语义（WebGL1 不支持）或只给一个顶点上色，观察差异。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ------------------------------------------------------------------
+ * varying 的传递链路：
+ *   顶点着色器里 vColor = aColor;          （每个顶点一份值）
+ *        ↓ 光栅化：在三角形内部按重心坐标插值
+ *   片元着色器里 vec3 c = vColor;          （每个像素一份值，已经是插好的）
+ *
+ * 注意：varying 在顶点着色器必须写、在片元着色器必须读，
+ *      两边的变量名和类型必须完全一致，精度限定符也要兼容，
+ *      否则链接阶段会报 "varying ... does not match"。
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec2 aPos;
+  attribute vec3 aColor;      // 每个顶点自己的颜色
+
+  varying vec3 vColor;        // 输出给片元着色器的插值变量
+
+  void main() {
+    vColor = aColor;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec3 vColor;
+
+  void main() {
+    // 这里的 vColor 已经是「按像素插值后」的颜色
+    gl_FragColor = vec4(vColor, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ------------------------------------------------------------------
+ * 交错缓冲区：把位置和颜色打进同一个数组
+ * ----------------------------------------------------------------
+ * 每个顶点占 5 个 float：x, y, r, g, b
+ *   字节数 = 5 * 4 = 20  -> stride = 20
+ *   位置偏移 0 字节，颜色偏移 2*4 = 8 字节
+ *
+ * 比起「位置一个 buffer、颜色一个 buffer」：
+ *   - 少一次 bindBuffer / vertexAttribPointer
+ *   - 同一顶点的数据在显存里连续，GPU 取数时缓存命中率更高
+ *   代价是更新某一项时要整块重写（可以用 bufferSubData 局部更新）。
+ *
+ * 这就是第 3 课里提到的 stride / offset 真正派上用场的地方。
+ * ------------------------------------------------------------------ */
+const VERTEX_COUNT = 3;
+
+const data = new Float32Array([
+  // x      y      r     g     b
+   0.00,  0.70,   1.00, 0.30, 0.35,   // 顶：红
+  -0.62, -0.45,   0.20, 0.85, 0.55,   // 左下：绿
+   0.62, -0.45,   0.30, 0.55, 1.00    // 右下：蓝
+]);
+
+const STRIDE = 5 * 4;   // 每个顶点 20 字节
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+const aPosLoc   = gl.getAttribLocation(program, 'aPos');
+const aColorLoc = gl.getAttribLocation(program, 'aColor');
+
+// 位置：2 个分量，从第 0 字节开始
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 5 * Float32Array.BYTES_PER_ELEMENT, 0);
+
+// 颜色：3 个分量，从第 8 字节开始（跳过 x, y）
+gl.enableVertexAttribArray(aColorLoc);
+gl.vertexAttribPointer(aColorLoc, 3, gl.FLOAT, false, 5 * Float32Array.BYTES_PER_ELEMENT, 2 * Float32Array.BYTES_PER_ELEMENT);
+
+/* ------------------------------------------------------------------
+ * 一个常见坑：两个 attribute 必须绑定「同一个」ARRAY_BUFFER 时才能共享偏移。
+ * 如果中途 bindBuffer 换了别的 buffer 再调用 vertexAttribPointer，
+ * 那个 attribute 就指向新的 buffer 了 —— 偏移是相对「绑定时」的 buffer 算的。
+ * ------------------------------------------------------------------ */
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+function render() {
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // 用更细腻的网格观察插值：把 3 个顶点拆成 3 个独立三角形（退化），
+  // 这里保持简单，直接画原始三角形。
+  gl.drawArrays(gl.TRIANGLES, 0, VERTEX_COUNT);
+}
+render();
+
+/* ------------------------------------------------------------------
+ * 想验证「插值真的发生在 GPU 里」？
+ *   把 FRAG_SRC 的 gl_FragColor 改成 vec4(vColor, 1.0) 是现在的效果；
+ *   改成 vec4(vec3(gl_FragCoord.x / 1000.0), 1.0) 就会发现颜色只跟像素坐标有关
+ *   —— 这说明片元着色器拿到的确实是「每个像素」的数据。
+ *
+ * 精度提示：varying 默认 highp（顶点）/ mediump（片元）的差异，
+ *   在极端坐标下会造成色带（banding），需要时显式声明 highp。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

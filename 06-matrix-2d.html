@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · 矩阵变换：平移 / 旋转 / 缩放</title>
+<!--
+  ============================================================
+  第 6 课：矩阵 —— 把一堆变换压成一次乘法
+  ------------------------------------------------------------
+  上一课用 sin/cos 手写旋转，但只要需求变成
+  「缩放 -> 旋转 -> 平移 -> 再套一层父级变换」，手写就崩了。
+
+  矩阵的价值在于：多个变换可以预先相乘成一个矩阵，
+  顶点在着色器里只做一次 vec4 * mat4 运算。
+
+  本课新知识点：
+    1. 列主序（column-major）内存布局 —— 新手最容易搞错的一点
+    2. 变换的复合顺序：矩阵从右往左作用于顶点
+    3. drawElements + 索引缓冲区：4 个顶点画 2 个三角形
+    4. 宽高比修正（否则正方形会被拉成长方形）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 06</div>
+  <h1>矩阵变换：平移 / 旋转 / 缩放</h1>
+  <p>中心的方块自转，外围 8 个方块围绕它公转，同时各自自转 —— 全部由矩阵组装而成。</p>
+  <div class="tip">每帧只向 GPU 传 9 个矩阵，几何数据一次都没动过。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 极简 mat4 工具（列主序，和 OpenGL / GLSL 的约定一致）
+ * ----------------------------------------------------------------
+ * 内存布局是关键。一个 4x4 矩阵在 Float32Array 里按下标存放为：
+ *
+ *   下标:  0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15
+ *   含义:  m00 m10 m20 m30 ...
+ *
+ * 也就是说，下标 0~3 是「第一列」而不是「第一行」。
+ * 平移量放在下标 12,13,14（第四列），这就是为什么写错位置时
+ * 平移完全没效果 —— 这是 WebGL 新手最高频的翻车点之一。
+ *
+ * 另一个好处：列主序数组可以直接传 uniformMatrix4fv，不需要转置。
+ * ================================================================== */
+const M4 = {
+  identity() {
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+  },
+
+  /** 返回 a · b（先应用 b，再应用 a） */
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) {
+      for (let r = 0; r < 4; r++) {
+        o[c * 4 + r] =
+          a[r]      * b[c * 4    ] +
+          a[4 + r]  * b[c * 4 + 1] +
+          a[8 + r]  * b[c * 4 + 2] +
+          a[12 + r] * b[c * 4 + 3];
+      }
+    }
+    return o;
+  },
+
+  translate(x, y, z) {
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]);
+  },
+
+  scale(x, y, z) {
+    return new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]);
+  },
+
+  /** 绕 Z 轴旋转（2D 场景的旋转就是绕 Z 轴） */
+  rotateZ(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]);
+  },
+
+  /** 链式乘法糖：M4.chain(A, B, C) === A·B·C */
+  chain(...mats) {
+    return mats.reduce((acc, m) => M4.mul(acc, m), M4.identity());
+  }
+};
+
+/* ------------------------------------------------------------------
+ * 着色器：一个 mat4 uniform 管所有变换
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec2 aPos;
+
+  uniform mat4 uMvp;      // 模型矩阵（本例没有相机，所以它直接通向裁剪空间）
+
+  void main() {
+    // 注意顺序：矩阵在左，向量在右。GLSL 会自动处理成 4x4 * 4x1
+    gl_Position = uMvp * vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  uniform vec3 uColor;
+  void main() { gl_FragColor = vec4(uColor, 1.0); }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ------------------------------------------------------------------
+ * 一个单位正方形：4 个顶点 + 6 个索引
+ *   顶点 0:(-1,-1) 1:(1,-1) 2:(1,1) 3:(-1,1)   → 边长 2，中心在原点
+ *   索引 0,1,2 与 0,2,3 组成两个三角形，都是逆时针（正面朝观察者）
+ *
+ * 为什么用索引？4 个顶点画 2 个三角形，顶点复用一次。
+ * 立方体更夸张：24 个顶点（每面 4 个，因为法线不同不能共享）
+ * 画出 12 个三角形，用 drawArrays 则需要 36 个顶点。
+ * ------------------------------------------------------------------ */
+const quadVerts = new Float32Array([
+  -1, -1,
+   1, -1,
+   1,  1,
+  -1,  1
+]);
+const quadIndices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+
+// 索引缓冲区必须绑到 ELEMENT_ARRAY_BUFFER，和 ARRAY_BUFFER 是两个不同的槽位
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIndices, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uMvpLoc   = gl.getUniformLocation(program, 'uMvp');
+const uColorLoc = gl.getUniformLocation(program, 'uColor');
+
+function drawQuad(mvp, r, g, b) {
+  gl.uniformMatrix4fv(uMvpLoc, false, mvp);  // false = 不要转置（已经是列主序）
+  gl.uniform3f(uColorLoc, r, g, b);
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  // 宽高比修正：把 x 压缩 1/aspect，画出来的正方形才是正方形。
+  // 3D 场景里这一步由投影矩阵（第 7 课）负责。
+  const fixAspect = M4.scale(1 / aspect, 1, 1);
+
+  /* ---- 中心方块：自转 + 呼吸 ---- */
+  const center = M4.chain(
+    fixAspect,
+    M4.rotateZ(t * 1.2),
+    M4.scale(0.22, 0.22, 1)
+  );
+  drawQuad(center, 0.36, 0.82, 1.0);
+
+  /* ---- 外围 8 个：公转 + 自转 ---- */
+  const N = 8;
+  for (let i = 0; i < N; i++) {
+    const a = t * 0.6 + (i / N) * Math.PI * 2;
+    const radius = 0.62 + 0.06 * Math.sin(t * 1.4 + i);
+
+    // 复合顺序 = 从右往左读：
+    //   1) scale       把单位方块缩小成 0.1
+    //   2) rotateZ     让它自转（绕自身原点）
+    //   3) translate   移动到圆的轨道上
+    // 如果换成 translate 在右边，物体会先被平移再绕原点旋转，
+    // 看上去就是「绕着远方某个点甩」，效果完全不同。
+    const m = M4.chain(
+      fixAspect,
+      M4.translate(Math.cos(a) * radius, Math.sin(a) * radius, 0),
+      M4.rotateZ(t * 2.0 + i),
+      M4.scale(0.10, 0.10, 1)
+    );
+
+    const hue = (i / N) * 0.8;
+    drawQuad(m,
+      0.55 + 0.45 * Math.sin(hue * 6.28 + 0.0),
+      0.55 + 0.45 * Math.sin(hue * 6.28 + 2.1),
+      0.55 + 0.45 * Math.sin(hue * 6.28 + 4.2));
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 记住这张「变换顺序」表，可以省掉大量调试时间：
+ *   M4.chain(fixAspect, translate(x,y), rotateZ(a), scale(s))
+ *   读作：先缩放 → 再旋转 → 再平移 → 最后修正宽高比
+ *   数学上：P' = fixAspect · T · R · S · P
+ *
+ * 所有 3D 引擎里的「局部坐标 -> 世界坐标 -> 相机坐标 -> 裁剪坐标」
+ * 就是这条链再往右挂两个矩阵（视图矩阵、投影矩阵）。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

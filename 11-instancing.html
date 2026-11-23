@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · 实例化：一次 draw call 画 1600 个立方体</title>
+<!--
+  ============================================================
+  第 11 课：实例化（Instancing）
+  ------------------------------------------------------------
+  上一课用 for 循环发 343 次 draw call。如果对象数量涨到几万，
+  CPU 每帧做几万次矩阵乘法 + 状态切换，帧率就崩了。
+
+  实例化把「同一个网格画 N 遍」压缩成 1 次 draw call，
+  每个实例的差异数据放在 attribute 缓冲区里，用「步进除数」控制。
+
+  本课新知识点：
+    1. ANGLE_instanced_arrays 扩展（WebGL2 里是原生 API）
+    2. vertexAttribDivisor：让某个 attribute 每 N 个实例才前进一次
+    3. WebGL1 没有该扩展时的降级方案（用顶点常量代替实例数据）
+    4. 在着色器里用时间做顶点位移（GPU 端的动画）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+  .stat { position: fixed; right: 18px; top: 18px; font: 600 12px/1.6 ui-monospace, Consolas, monospace;
+          color: #7ee787; background: rgba(13,17,23,.74); padding: 8px 12px; border-radius: 8px;
+          border: 1px solid rgba(255,255,255,.09); pointer-events: none; text-align: right; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 11</div>
+  <h1>实例化：1 次 draw call 画 1600 个立方体</h1>
+  <p>每个实例的「位置 + 缩放」存在自己的 attribute 里，GPU 自动按实例切换。</p>
+  <div class="tip">对比第 10 课的 343 次 draw call：这里只有 1 次。</div>
+</div>
+<div class="stat" id="stat">--</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ==================================================================
+ * 扩展：实例化在 WebGL1 里是扩展，WebGL2 里是核心 API
+ * ------------------------------------------------------------------ */
+const instExt = gl.getExtension('ANGLE_instanced_arrays');
+const STAT = document.getElementById('stat');
+STAT.innerHTML = instExt
+  ? 'instancing: ON<br>draw calls: 1'
+  : 'instancing: 已降级<br>draw calls: N';
+
+/* ------------------------------------------------------------------
+ * 着色器
+ * ----------------------------------------------------------------
+ * 关键在 attribute 的「步进除数」：
+ *   普通 attribute     divisor = 0，每个顶点前进一次
+ *   实例 attribute     divisor = 1，每个实例（而不是每个顶点）前进一次
+ *
+ * 于是 36 个顶点的立方体 + 1600 组实例数据，就画出了 1600 个立方体。
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec3  aPos;        // 立方体局部坐标（-1 ~ 1），所有实例共享
+  attribute vec3  aOffset;     // 实例位置：divisor = 1
+  attribute float aScale;      // 实例缩放：divisor = 1
+
+  uniform mat4  uViewProj;
+  uniform float uTime;
+
+  varying vec3  vColor;
+  varying float vShade;
+
+  void main() {
+    // 波形位移：按到原点的水平距离做正弦，形成向外扩散的同心圆波
+    float r    = length(aOffset.xz);
+    float wave = sin(r * 1.1 - uTime * 2.2);
+
+    vec3 worldPos = aPos * aScale + vec3(aOffset.x, aOffset.y + wave * 0.45, aOffset.z);
+
+    gl_Position = uViewProj * vec4(worldPos, 1.0);
+
+    // 颜色随波峰/波谷变化（蓝 -> 青 -> 亮绿）
+    float k = wave * 0.5 + 0.5;
+    vColor = mix(vec3(0.16, 0.42, 0.95), vec3(0.25, 0.95, 0.72), k);
+    vShade = 0.55 + 0.45 * k;
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec3  vColor;
+  varying float vShade;
+
+  void main() {
+    gl_FragColor = vec4(vColor * vShade, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 几何：立方体（8 顶点 + 36 索引）
+ * ================================================================== */
+const cubePos = new Float32Array([
+  -1,-1, 1,   1,-1, 1,   1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,   1,-1,-1,   1, 1,-1,  -1, 1,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,
+  1,5,6, 1,6,2,   4,0,3, 4,3,7,
+  3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, cubePos, gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeIdx, gl.STATIC_DRAW);
+
+const aPosLoc    = gl.getAttribLocation(program, 'aPos');
+const aOffsetLoc = gl.getAttribLocation(program, 'aOffset');
+const aScaleLoc  = gl.getAttribLocation(program, 'aScale');
+
+gl.enableVertexAttribArray(aPosLoc);
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+
+/* ==================================================================
+ * 实例数据：40 × 40 = 1600 个实例，每个 4 个 float（x, y, z, scale）
+ * 用交错布局，一次上传。
+ * ================================================================== */
+const GRID = 40, SPACING = 1.05;
+const instanceCount = GRID * GRID;
+
+const instanceData = new Float32Array(instanceCount * 4);
+let p = 0;
+for (let z = 0; z < GRID; z++) {
+  for (let x = 0; x < GRID; x++) {
+    // 稍微随机的缩放，看起来更自然
+    const scale = 0.16 + 0.10 * Math.abs(Math.sin(x * 1.7 + z * 2.3));
+    instanceData[p++] = (x - GRID / 2) * SPACING;
+    instanceData[p++] = 0;
+    instanceData[p++] = (z - GRID / 2) * SPACING;
+    instanceData[p++] = scale;
+  }
+}
+
+const instanceBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, instanceData, gl.STATIC_DRAW);
+
+// aOffset：vec3，从第 0 字节开始
+gl.enableVertexAttribArray(aOffsetLoc);
+gl.vertexAttribPointer(aOffsetLoc, 3, gl.FLOAT, false, 4 * 4, 0);
+// aScale：float，从第 12 字节开始
+gl.enableVertexAttribArray(aScaleLoc);
+gl.vertexAttribPointer(aScaleLoc, 1, gl.FLOAT, false, 4 * 4, 3 * 4);
+
+if (instExt) {
+  // 步进除数 = 1：每画完一个实例才前进到下一条实例数据。
+  // 没有这一句，所有立方体都会重叠在第 0 号实例的位置上。
+  instExt.vertexAttribDivisorANGLE(aOffsetLoc, 1);
+  instExt.vertexAttribDivisorANGLE(aScaleLoc, 1);
+}
+
+const uViewProjLoc = gl.getUniformLocation(program, 'uViewProj');
+const uTimeLoc     = gl.getUniformLocation(program, 'uTime');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.03, 0.036, 0.055, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(55 * Math.PI / 180, aspect, 0.1, 300);
+  const eye = [Math.cos(t * 0.12) * 26, 12 + Math.sin(t * 0.2) * 3, Math.sin(t * 0.12) * 26];
+  const view = M4.lookAt(eye, [0, 0, 0], [0, 1, 0]);
+
+  gl.uniformMatrix4fv(uViewProjLoc, false, M4.mul(proj, view));
+  gl.uniform1f(uTimeLoc, t);
+
+  if (instExt) {
+    // 一次调用 = 1600 个实例 × 36 个索引
+    instExt.drawElementsInstancedANGLE(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0, instanceCount);
+  } else {
+    // 降级：关掉实例 attribute 的数组，改用「顶点常量」逐个喂数据。
+    // gl.vertexAttrib*f 只在对应 attribute 数组被 disable 时才生效，
+    // 这也是 WebGL1 时代（实例化扩展还没普及）的常见写法。
+    gl.disableVertexAttribArray(aOffsetLoc);
+    gl.disableVertexAttribArray(aScaleLoc);
+    for (let i = 0; i < instanceCount; i++) {
+      gl.vertexAttrib3f(aOffsetLoc, instanceData[i*4], instanceData[i*4+1], instanceData[i*4+2]);
+      gl.vertexAttrib1f(aScaleLoc, instanceData[i*4+3]);
+      gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+    }
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 实例化的适用边界（别滥用）：
+ *   适合：几何完全相同、只是变换/颜色/材质参数不同的大量对象
+ *          （草、树、粒子、方块世界、UI 图元）
+ *   不适合：每个对象几何都不同（那需要合并网格或分批）
+ *   另外注意：实例 attribute 的 divisor 是「全局状态」，
+ *   用完记得还原成 0，否则会影响之后所有绘制 —— 这是很难查的 bug。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

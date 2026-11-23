@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · 一个三角形：顶点缓冲区与裁剪空间</title>
+<!--
+  ============================================================
+  第 3 课：三角形 —— WebGL 真正的基本图元
+  ------------------------------------------------------------
+  为什么是三角形？
+    GPU 只会光栅化三角形。四边形要拆成 2 个三角形，圆是很多三角形，
+    立方体 12 个三角形，球体成百上千个。所有模型最终都是三角形汤。
+
+  本课新知识点：
+    1. 用一段连续的顶点数组描述几何（VBO 的标准用法）
+    2. attribute 的 stride / offset 参数（顶点之间「怎么跳」）
+    3. 顶点顺序（绕序）决定正面朝向
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 03</div>
+  <h1>一个三角形：顶点缓冲区与裁剪空间</h1>
+  <p>3 个顶点，1 次 drawArrays。从这一课开始，几何数据都在 GPU 的缓冲区里。</p>
+  <div class="tip">把三个顶点改成 (-1,-1) (1,-1) (0,1) 就能看到裁剪边界。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ------------------------------------------------------------------
+ * 着色器：这次顶点坐标来自 attribute，不再是写死的
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec2 aPos;
+
+  void main() {
+    // 这里直接把坐标当裁剪空间坐标用：数值落在 [-1, 1] 才在屏幕内。
+    // 真实的 3D 流程是：模型坐标 --(模型矩阵)--> 世界坐标
+    //                --(视图矩阵)--> 相机坐标 --(投影矩阵)--> 裁剪空间
+    // 第 6 课开始引入矩阵。
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  uniform vec3 uColor;
+
+  void main() {
+    gl_FragColor = vec4(uColor, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ------------------------------------------------------------------
+ * 顶点缓冲区（VBO = Vertex Buffer Object）
+ * ------------------------------------------------------------------
+ * 裸数组是「交错」还是「分离」？
+ *   分离：所有位置放一个 buffer（这里用的方式，最简单）
+ *   交错：位置、法线、UV 依次排在一起，一次绑定搞定，缓存命中率更高
+ *         （第 9 课会用到交错布局，届时 stride/offset 就有意义了）
+ *
+ * 顶点顺序（绕序 winding）：
+ *   下面 3 个点按逆时针排列，从屏幕正面看是「逆时针 = 正面」。
+ *   gl.frontFace 默认 CCW，若开启 gl.enable(gl.CULL_FACE)，
+ *   顺时针排列的面就会被剔除。本课没开剔除，所以画不出区别。
+ * ------------------------------------------------------------------ */
+const positions = new Float32Array([
+  //  x      y
+   0.0,    0.62,   // 顶
+  -0.55,  -0.38,   // 左下
+   0.55,  -0.38    // 右下
+]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+// stride = 0 表示「紧密排列」，GPU 自己按 2 个 float 一组往后走
+// 等价写法：gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 8, 0)
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uColorLoc = gl.getUniformLocation(program, 'uColor');
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+function render() {
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.uniform3f(uColorLoc, 0.35, 0.78, 0.98);
+  // drawArrays(图元类型, 从第几个顶点开始, 用多少个顶点)
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 静态画面，不需要每帧重绘；这里只为了演示，实际可以只画一次。
+  // requestAnimationFrame(render);
+}
+render();
+
+/* ------------------------------------------------------------------
+ * 顺便体会一下「4 个顶点画不出四边形」这件事：
+ * gl.TRIANGLE_STRIP / gl.TRIANGLE_FAN 可以用 n 个顶点拼出 n-2 个三角形，
+ * 但 GPU 依然是逐三角形填充的。第 7 课的立方体用索引缓冲区(drawElements)
+ * 来共享顶点，比用 strip 更通用。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

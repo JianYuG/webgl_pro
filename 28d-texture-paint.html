@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>28D · 纹理画板：多边形贴上图片</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #101218; }
+  #glcanvas { position: absolute; inset: 0; width: 100%; height: 100%;
+              display: block; cursor: crosshair; touch-action: none; }
+  body.dragging::after {
+    content: "松手载入这张图 →"; position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(47,111,237,.18); border: 3px dashed #2f6fed;
+    color: #fff; font: 600 22px "Microsoft YaHei", sans-serif; pointer-events: none;
+  }
+
+  #hud {
+    position: absolute; top: 16px; left: 16px; width: 236px;
+    background: rgba(18, 21, 30, 0.92); border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px; padding: 14px 16px; color: #dfe3ea;
+    font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+    backdrop-filter: blur(6px); user-select: none;
+  }
+  #hud h1 { font-size: 14px; letter-spacing: 1px; margin-bottom: 2px; }
+  #hud .sub { font-size: 11px; color: #8b93a5; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .label { font-size: 11px; color: #8b93a5; width: 40px; }
+
+  .swatch { width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+            border: 2px solid transparent; transition: transform .1s, border-color .1s; }
+  .swatch:hover { transform: scale(1.15); }
+  .swatch.active { border-color: #fff; transform: scale(1.15); }
+
+  .btn { flex: 1; padding: 6px 0; text-align: center; font-size: 12px;
+         background: rgba(255,255,255,0.07); color: #dfe3ea; border: 1px solid rgba(255,255,255,0.12);
+         border-radius: 7px; cursor: pointer; transition: background .12s; }
+  .btn:hover { background: rgba(255,255,255,0.14); }
+  .btn.active { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+
+  input[type=range] { flex: 1; accent-color: #2f6fed; }
+  #texStatus { margin: 8px 0 0; font-size: 11px; color: #52d273;
+               line-height: 1.6; word-break: break-all; }
+  #texStatus.warn { color: #f0b429; }
+  #hint { margin-top: 10px; font-size: 11px; color: #6d7484; line-height: 1.7; }
+  #stats { margin-top: 8px; font-size: 11px; color: #52d273; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<input type="file" id="filePick" accept="image/*" style="display:none">
+
+<div id="hud">
+  <h1>WEBGL 纹理画板</h1>
+  <div class="sub">28D · 多边形 × 图片纹理</div>
+
+  <div class="row">
+    <span class="label">贴图</span>
+    <div class="btn" id="texBrick">砖墙</div>
+    <div class="btn" id="texWood">木纹</div>
+    <div class="btn" id="texGrid">校准图</div>
+    <div class="btn" id="texPick">选图…</div>
+  </div>
+  <div id="texStatus">正在加载 assets/brick.png …</div>
+
+  <div class="row" id="colors"></div>
+
+  <div class="row">
+    <span class="label">描边</span>
+    <input type="range" id="size" min="4" max="40" value="12">
+    <span id="sizeVal" style="width:22px;font-size:11px;color:#8b93a5">12</span>
+  </div>
+
+  <div class="row">
+    <div class="btn" id="undo">撤销 Ctrl+Z</div>
+    <div class="btn" id="clear">清空</div>
+  </div>
+
+  <div id="hint">
+    单击落锚点画多边形，实时预览<br>
+    双击或 Enter 结束（≥3 点自动闭合）· Esc 取消<br>
+    图片也可直接拖进窗口 · Ctrl+Z 撤销
+  </div>
+  <div id="stats"></div>
+</div>
+
+<script>
+/* ==================================================================
+ * 28D · 纹理画板 —— 画一个多边形，用真实图片把它填满
+ * ==================================================================
+ * 08 课学过 UV 贴图（立方体规则表面），本课把它用到「任意形状」上：
+ *
+ * 【UV 怎么给不规则多边形？】用包围盒归一化：
+ *      u = (x - minX) / spanX
+ *      v = (y - minY) / spanY      （Y 轴配合 UNPACK_FLIP_Y 对齐）
+ *   效果 = CSS background-size: 100% 100%——图片被拉伸铺满整个形状。
+ *   顶点落在包围盒哪里，就采样图片哪个位置；三角形内部的像素由
+ *   varying 插值自动算出（又是免费插值，04 课的原理）。
+ *
+ * 【file:// 打开时图片能贴吗？】——这是 08b 课踩过的跨域污染坑：
+ *   ① 相对路径 <img> 能显示，但 texImage2D 上传会抛 SecurityError
+ *   ② blob: URL（fetch/File/drag）不受跨域限制
+ * 本课的三级加载策略：
+ *   a) Image + 相对路径（localhost 服务器下直接成功）
+ *   b) 抛 SecurityError → 改用 fetch → blob URL 再传一次
+ *   c) fetch 也被禁（Chrome 的 file://）→ 提示拖拽图片/选图/起服务器
+ * Firefox 的 file:// 允许读同目录文件，走 a 或 b 就能成功。
+ *
+ * 【渲染结构】两个程序三块缓冲：
+ *   progTex ：面填充，逐顶点 [x, y, u, v]，texture2D 采样
+ *   progFlat：描边四边形 + 预览（28C 的逐顶点色，纯色用法）
+ * ================================================================== */
+
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { antialias: true });
+if (!gl) { document.getElementById('hint').textContent = '当前浏览器不支持 WebGL'; throw new Error('no webgl'); }
+
+const VS_TEX = `
+  attribute vec2 aPos;
+  attribute vec2 aUV;
+  uniform vec2 uRes;
+  varying vec2 vUV;
+  void main() {
+    vec2 clip = (aPos / uRes * 2.0 - 1.0) * vec2(1.0, -1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    vUV = aUV;
+  }
+`;
+const FS_TEX = `
+  precision mediump float;
+  varying vec2 vUV;
+  uniform sampler2D uTex;
+  void main() { gl_FragColor = texture2D(uTex, vUV); }
+`;
+const VS_FLAT = `
+  attribute vec2 aPos;
+  attribute vec4 aColor;
+  uniform vec2 uRes;
+  varying vec4 vColor;
+  void main() {
+    vec2 clip = (aPos / uRes * 2.0 - 1.0) * vec2(1.0, -1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    vColor = aColor;
+  }
+`;
+const FS_FLAT = `
+  precision mediump float;
+  varying vec4 vColor;
+  void main() { gl_FragColor = vColor; }
+`;
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('shader: ' + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+function linkProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error('link: ' + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+const progTex   = linkProgram(VS_TEX, FS_TEX);
+const progFlat  = linkProgram(VS_FLAT, FS_FLAT);
+const T = {
+  aPos: gl.getAttribLocation(progTex, 'aPos'),
+  aUV:  gl.getAttribLocation(progTex, 'aUV'),
+  uRes: gl.getUniformLocation(progTex, 'uRes'),
+  uTex: gl.getUniformLocation(progTex, 'uTex')
+};
+const F = {
+  aPos:   gl.getAttribLocation(progFlat, 'aPos'),
+  aColor: gl.getAttribLocation(progFlat, 'aColor'),
+  uRes:   gl.getUniformLocation(progFlat, 'uRes')
+};
+gl.enableVertexAttribArray(T.aPos);
+gl.enableVertexAttribArray(T.aUV);
+gl.enableVertexAttribArray(F.aPos);
+gl.enableVertexAttribArray(F.aColor);
+
+/* ---------------- 数据层 ----------------
+ * fill：纹理面，每顶点 [x, y, u, v]（FPV=4）
+ * line：描边，每顶点 [x, y, r, g, b, a]（28C 的四边形膨胀）
+ * 三块缓冲照例初始化时按容量预分配（28B 的 buffer overflow 坑） */
+const FPVF = 4, BYTESF = FPVF * 4;
+const FPV6 = 6, BYTES6 = FPV6 * 4;
+const CAPF = 120000, CAP6 = 200000, PRE_CAP = 8192;
+
+const fill = { data: new Float32Array(CAPF * FPVF), count: 0, uploaded: 0, buf: gl.createBuffer() };
+const line = { data: new Float32Array(CAP6 * FPV6), count: 0, uploaded: 0, buf: gl.createBuffer() };
+const previewData = new Float32Array(PRE_CAP);
+const previewBuf = gl.createBuffer();
+
+for (const b of [fill, line, { data: previewData, buf: previewBuf }]) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, b.buf);
+  gl.bufferData(gl.ARRAY_BUFFER, b.data.byteLength, gl.DYNAMIC_DRAW);
+}
+
+const shapes = [];   // 撤销栈：{ fillStart, lineStart }
+
+/* ---------------- 几何写入（28C 同款，颜色版用于描边/预览） ---------------- */
+let dpr = 1;
+let dirty = true;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth  * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    dirty = true;
+  }
+}
+
+/* 颜色版三角形：p = { x, y, c: [r,g,b,a] } */
+function pushTri(arr, v, p1, p2, p3) {
+  if (v + 18 > arr.length) return v;
+  const w = (i, p) => {
+    arr[i] = p.x; arr[i+1] = p.y;
+    arr[i+2] = p.c[0]; arr[i+3] = p.c[1]; arr[i+4] = p.c[2]; arr[i+5] = p.c[3];
+  };
+  w(v, p1); w(v + 6, p2); w(v + 12, p3);
+  return v + 18;
+}
+function pushQuad(arr, v, a, b, halfW) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.5) return v;
+  const nx = -dy / len * halfW, ny = dx / len * halfW;
+  const at = (p, sx, sy) => ({ x: p.x + sx, y: p.y + sy, c: p.c });
+  v = pushTri(arr, v,  at(a, nx, ny),  at(b, nx, ny),  at(a, -nx, -ny));
+  v = pushTri(arr, v,  at(b, nx, ny),  at(b, -nx, -ny), at(a, -nx, -ny));
+  return v;
+}
+function pushFan(arr, v, pts) {
+  for (let i = 1; i < pts.length - 1; i++) {
+    v = pushTri(arr, v, pts[0], pts[i], pts[i+1]);
+  }
+  return v;
+}
+/* UV 版三角形：p = { x, y, u, v } */
+function pushTriUV(arr, v, p1, p2, p3) {
+  if (v + 12 > arr.length) return v;
+  const w = (i, p) => { arr[i] = p.x; arr[i+1] = p.y; arr[i+2] = p.u; arr[i+3] = p.v; };
+  w(v, p1); w(v + 4, p2); w(v + 8, p3);
+  return v + 12;
+}
+function pushFanUV(arr, v, pts) {
+  for (let i = 1; i < pts.length - 1; i++) {
+    v = pushTriUV(arr, v, pts[0], pts[i], pts[i+1]);
+  }
+  return v;
+}
+
+/* ---------------- 纹理状态与三级加载 ---------------- */
+let texture = null;          // { tex, name }
+const statusEl = document.getElementById('texStatus');
+function status(msg, warn) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('warn', !!warn);
+}
+
+/* 把一张已解码的 Image 变成 WebGL 纹理。
+ * 512² 是 2 的幂，本可以 mipmap；但包围盒 UV 会把图片拉满整个形状，
+ * 远远超出 mipmap 的收益场景，LINEAR + CLAMP 就够了（08 课的取舍）。
+ * UNPACK_FLIP_Y：图片坐标 Y 向下，纹理坐标 V 向上，上传时翻过来 */
+function makeTexture(img) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  return tex;
+}
+function setTexture(tex, name) {
+  texture = { tex, name };
+  status('当前贴图：' + name);
+  dirty = true;
+}
+
+function loadSample(url, name) {
+  status('正在加载 ' + url + ' …');
+  const img = new Image();
+  img.onload = () => {
+    try {
+      setTexture(makeTexture(img), name);              // a) 相对路径直接上传
+    } catch (e) {
+      loadViaFetch(url, name);                         // b) 跨域污染 → blob 兜底
+    }
+  };
+  img.onerror = () => status('图片加载失败：' + url, true);
+  img.src = url;
+}
+function loadViaFetch(url, name) {
+  status('跨域污染，尝试 blob 兜底…', true);
+  fetch(url).then(r => r.blob()).then(blob => {
+    const img = new Image();
+    img.onload = () => {
+      try { setTexture(makeTexture(img), name); }
+      catch (e) { noWay(); }
+    };
+    img.onerror = noWay;
+    img.src = URL.createObjectURL(blob);
+  }).catch(noWay);
+}
+function noWay() {
+  status('file:// 下读不了本地图片：把图片拖进窗口、点「选图…」，或起本地服务器（python -m http.server）', true);
+}
+
+/* 本地文件（拖拽/选图）→ blob URL，从根上绕开跨域限制 */
+function loadLocalFile(file) {
+  const img = new Image();
+  img.onload = () => setTexture(makeTexture(img), file.name);
+  img.src = URL.createObjectURL(file);
+}
+
+document.getElementById('texBrick').onclick = () => loadSample('assets/brick.png', '砖墙 brick.png');
+document.getElementById('texWood').onclick  = () => loadSample('assets/wood.png',  '木纹 wood.png');
+document.getElementById('texGrid').onclick  = () => loadSample('assets/uv-grid.png', 'UV 校准图');
+
+const filePick = document.getElementById('filePick');
+document.getElementById('texPick').onclick = () => filePick.click();
+filePick.onchange = () => { if (filePick.files[0]) loadLocalFile(filePick.files[0]); };
+
+window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragging'); });
+window.addEventListener('dragleave', e => { if (e.target === document.body) document.body.classList.remove('dragging'); });
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  document.body.classList.remove('dragging');
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) loadLocalFile(f);
+});
+
+/* 启动即加载默认贴图 */
+loadSample('assets/brick.png', '砖墙 brick.png');
+
+/* ---------------- 锚点交互（28C 的多边形工具原样搬来） ---------------- */
+const brush = { color: [0.30, 0.59, 0.99, 0.85], size: 12 };
+let anchors = [];
+let cursor = null;
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const x = e.offsetX, y = e.offsetY;
+  const la = anchors[anchors.length - 1];
+  if (la && Math.hypot(x - la.x, y - la.y) < 3) return;   // 3px 去重防双击
+  if (anchors.length >= 64) return;
+  anchors.push({ x, y });
+  cursor = { x, y };
+  dirty = true;
+});
+canvas.addEventListener('pointermove', e => {
+  cursor = { x: e.offsetX, y: e.offsetY };
+  dirty = true;
+});
+canvas.addEventListener('dblclick', () => finishShape());
+function finishShape() {
+  if (anchors.length < 3) { anchors = []; dirty = true; return; }
+  bakeShape(anchors);
+  anchors = [];
+  dirty = true;
+}
+function cancelShape() { anchors = []; dirty = true; }
+
+/* ---------------- 定稿：烤进面图层（带 UV）+ 描边图层 ---------------- */
+function bakeShape(pts) {
+  const P2 = pts.map(p => ({ x: p.x * dpr, y: p.y * dpr }));
+  /* 包围盒归一化 → 每个锚点的 UV（本课的核心一行） */
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of P2) {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  }
+  const spanX = Math.max(1e-6, maxX - minX);
+  const spanY = Math.max(1e-6, maxY - minY);
+  const UV = p => ({ x: p.x, y: p.y,
+                     u: (p.x - minX) / spanX, v: (p.y - minY) / spanY });
+
+  let v = fill.count * FPVF;
+  v = pushFanUV(fill.data, v, P2.map(UV));
+  const fillStart = fill.count;
+  fill.count = v / FPVF;
+
+  /* 描边：28C 的四边形膨胀，颜色用 brush.color */
+  const halfW = Math.max(1.5, brush.size * 0.5 * dpr);
+  const c = [brush.color[0], brush.color[1], brush.color[2], 0.9];
+  const C = P2.map(p => ({ x: p.x, y: p.y, c }));
+  let w = line.count * FPV6;
+  for (let i = 0; i < C.length - 1; i++) {
+    w = pushQuad(line.data, w, C[i], C[i+1], halfW);
+  }
+  const lineStart = line.count;
+  line.count = w / FPV6;
+
+  shapes.push({ fillStart, lineStart });
+  dirty = true;
+}
+
+/* ---------------- 撤销 / 清空 ---------------- */
+function undo() {
+  const s = shapes.pop();
+  if (!s) return;
+  fill.count = s.fillStart; fill.uploaded = 0;
+  line.count = s.lineStart; line.uploaded = 0;
+  cancelShape();
+  dirty = true;
+}
+function clearAll() {
+  shapes.length = 0;
+  fill.count = 0; fill.uploaded = 0;
+  line.count = 0; line.uploaded = 0;
+  cancelShape();
+  dirty = true;
+}
+
+/* ---------------- 工具面板 ---------------- */
+const PALETTE = [
+  ['#f2f4f8', '白'], ['#ff5d5d', '红'], ['#ff9f43', '橙'], ['#ffd93d', '黄'],
+  ['#6bcb77', '绿'], ['#4d96ff', '蓝'], ['#b58cff', '紫'], ['#2ee6d6', '青']
+];
+const colorsEl = document.getElementById('colors');
+PALETTE.forEach(([hex], i) => {
+  const b = document.createElement('div');
+  b.className = 'swatch' + (i === 5 ? ' active' : '');
+  b.style.background = hex;
+  b.title = hex;
+  b.onclick = () => {
+    brush.color = [
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255, 0.85
+    ];
+    colorsEl.querySelectorAll('.swatch').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    dirty = true;
+  };
+  colorsEl.appendChild(b);
+});
+
+const sizeEl = document.getElementById('size');
+const sizeVal = document.getElementById('sizeVal');
+sizeEl.oninput = () => { brush.size = +sizeEl.value; sizeVal.textContent = sizeEl.value; };
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = clearAll;
+
+window.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+  if (e.key === 'Enter') finishShape();
+  if (e.key === 'Escape') cancelShape();
+  if (e.key === '[') { sizeEl.value = Math.max(4, brush.size - 4); sizeEl.oninput(); }
+  if (e.key === ']') { sizeEl.value = Math.min(40, brush.size + 4); sizeEl.oninput(); }
+});
+
+/* ---------------- 渲染 ---------------- */
+const statsEl = document.getElementById('stats');
+function render() {
+  if (!dirty) return;
+  dirty = false;
+
+  gl.clearColor(0.063, 0.071, 0.094, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.disable(gl.DEPTH_TEST);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  /* ---- draw ①：纹理填充面（progTex + 0 号纹理单元） ---- */
+  if (texture && fill.count > 0) {
+    gl.useProgram(progTex);
+    gl.uniform2f(T.uRes, canvas.width, canvas.height);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture.tex);
+    gl.uniform1i(T.uTex, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, fill.buf);
+    if (fill.count > fill.uploaded) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, fill.uploaded * BYTESF,
+                       fill.data.subarray(fill.uploaded * FPVF, fill.count * FPVF));
+      fill.uploaded = fill.count;
+    } else if (fill.uploaded > fill.count) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, fill.data.subarray(0, fill.count * FPVF));
+      fill.uploaded = fill.count;
+    }
+    gl.vertexAttribPointer(T.aPos, 2, gl.FLOAT, false, BYTESF, 0);
+    gl.vertexAttribPointer(T.aUV,  2, gl.FLOAT, false, BYTESF, 8);
+    gl.drawArrays(gl.TRIANGLES, 0, fill.count);
+  }
+
+  /* ---- draw ②：描边（progFlat，28C 的四边形膨胀） ---- */
+  gl.useProgram(progFlat);
+  gl.uniform2f(F.uRes, canvas.width, canvas.height);
+  gl.bindBuffer(gl.ARRAY_BUFFER, line.buf);
+  if (line.count > line.uploaded) {
+    gl.bufferSubData(gl.ARRAY_BUFFER, line.uploaded * BYTES6,
+                     line.data.subarray(line.uploaded * FPV6, line.count * FPV6));
+    line.uploaded = line.count;
+  } else if (line.uploaded > line.count) {
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, line.data.subarray(0, line.count * FPV6));
+    line.uploaded = line.count;
+  }
+  gl.vertexAttribPointer(F.aPos,   2, gl.FLOAT, false, BYTES6, 0);
+  gl.vertexAttribPointer(F.aColor, 4, gl.FLOAT, false, BYTES6, 8);
+  if (line.count > 0) gl.drawArrays(gl.TRIANGLES, 0, line.count);
+
+  /* ---- draw ③：预览（还没定稿的多边形，半透明扇形 + 虚线感描边） ---- */
+  if (anchors.length > 0 && cursor) {
+    const pts = anchors.concat([cursor]);
+    const c = brush.color;
+    const fillC  = [c[0], c[1], c[2], 0.22];
+    const ghostC = [c[0], c[1], c[2], 0.5];
+    const halfW = Math.max(1.5, brush.size * 0.5 * dpr);
+    const C = pts.map(p => ({ x: p.x * dpr, y: p.y * dpr, c: fillC }));
+    let v = 0;
+    v = pushFan(previewData, v, C);
+    for (let i = 0; i < C.length - 1; i++) {
+      v = pushQuad(previewData, v,
+        { x: C[i].x, y: C[i].y, c: ghostC },
+        { x: C[i+1].x, y: C[i+1].y, c: ghostC }, halfW);
+    }
+    if (v > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, previewBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, previewData.subarray(0, v), gl.STREAM_DRAW);
+      gl.vertexAttribPointer(F.aPos,   2, gl.FLOAT, false, BYTES6, 0);
+      gl.vertexAttribPointer(F.aColor, 4, gl.FLOAT, false, BYTES6, 8);
+      gl.drawArrays(gl.TRIANGLES, 0, v / FPV6);
+    }
+  }
+
+  statsEl.textContent = `shapes ${shapes.length} · tris ${fill.count / 3} · tex ${texture ? texture.name : '未就绪'}`;
+}
+
+window.addEventListener('resize', resize);
+resize();
+function frame() {
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08B · 本地图片纹理：选图、拖拽与跨域</title>
+<!--
+  ============================================================
+  第 08B 课（专题）：把真实的本地图片变成纹理
+  ------------------------------------------------------------
+  第 8 课的纹理是 Canvas 现场画的。这一课解决真实需求：
+  「我电脑里有一张 jpg / png，怎么贴上去？」
+
+  本课新知识点：
+    1. texImage2D 的三种图片来源：Image / Canvas / ImageData
+    2. 浏览器同源策略与「canvas 污染」：
+         - file:// 双击打开时，相对路径 <img> 能"显示"，但像素被锁定，
+           texImage2D 会抛 SecurityError（本课实测过的行为）
+         - 用户主动选择的文件（File API / 拖拽）不受此限制 → 双击也能玩
+         - 起本地服务器（python -m http.server）则一切照常
+    3. NPOT（非 2 的幂）图片的处理：先重采样成 POT 再上传，
+       否则 REPEAT / mipmap 都用不了（WebGL1 的硬性限制）
+    4. UNPACK_FLIP_Y_WEBGL 为什么必须是 true（可用开关自己验证）
+    5. 各向异性过滤扩展 EXT_texture_filter_anisotropic：斜视表面更清晰
+    6. 纹理参数可以在上传后随时改（filter/wrap 不需要重新上传）
+
+  操作方式：
+    · 把任意图片从桌面拖进窗口
+    · 点「选择图片」按钮
+    · 点三张示例图按钮（assets/ 目录，双击打开时会被跨域拦截并给出提示）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+
+  /* ---- 控制面板（可交互，右上角） ---- */
+  .panel {
+    position: fixed; right: 18px; top: 18px; width: 232px;
+    padding: 13px 14px; border-radius: 12px;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.78);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+    font-size: 12.5px;
+  }
+  .panel h2 { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #7ee787; margin-bottom: 10px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; }
+  .row label { color: #98a4b3; flex: none; }
+  .row select, .row input[type=range] { flex: 1; max-width: 120px; accent-color: #58a6ff; }
+  .row select {
+    background: #161d29; color: #e6edf3; border: 1px solid rgba(255,255,255,.12);
+    border-radius: 6px; padding: 3px 6px; font-size: 12px;
+  }
+  .row .val { font: 500 11px/1 ui-monospace, Consolas, monospace; color: #ffa657; min-width: 20px; text-align: right; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .btns button {
+    flex: 1 1 auto; cursor: pointer; font: 500 12px/1.4 inherit; color: #e6edf3;
+    background: #1a2433; border: 1px solid rgba(255,255,255,.14);
+    border-radius: 7px; padding: 6px 9px;
+  }
+  .btns button:hover { background: #223046; border-color: rgba(88,166,255,.5); }
+  #fileInput { display: none; }
+  #status {
+    margin-top: 10px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10);
+    font: 500 11px/1.55 ui-monospace, Consolas, monospace; color: #8b98a8;
+    word-break: break-all;
+  }
+  #status.err { color: #ff7b72; }
+  #status.ok  { color: #7ee787; }
+
+  /* ---- 拖拽提示层 ---- */
+  #dropHint {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: rgba(88,166,255,.10); border: 2px dashed rgba(88,166,255,.55);
+    font: 600 20px/1 ui-sans-serif, system-ui; color: #cfe3ff; z-index: 9;
+  }
+  #dropHint.show { display: grid; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 08B</div>
+  <h1>本地图片纹理：选图、拖拽与跨域</h1>
+  <p>把真实的图片文件上传成 GPU 纹理。拖一张图进来，或者用右上的按钮。</p>
+  <div class="tip">
+    双击打开（file://）时只有「拖拽 / 选择文件」能读到像素；
+    相对路径的示例图会被浏览器跨域拦截 —— 这不是 bug，是同源策略，详见文末注释。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>TEXTURE CONTROL</h2>
+  <div class="row"><label>缩小过滤</label>
+    <select id="minFilter">
+      <option value="mipmap" selected>LINEAR_MIPMAP_LINEAR</option>
+      <option value="linear">LINEAR</option>
+      <option value="nearest">NEAREST</option>
+    </select>
+  </div>
+  <div class="row"><label>环绕模式</label>
+    <select id="wrap">
+      <option value="repeat" selected>REPEAT</option>
+      <option value="mirror">MIRRORED_REPEAT</option>
+      <option value="clamp">CLAMP_TO_EDGE</option>
+    </select>
+  </div>
+  <div class="row"><label>UV 平铺</label>
+    <input id="tiling" type="range" min="1" max="8" step="1" value="1">
+    <span class="val" id="tilingVal">1</span>
+  </div>
+  <div class="row"><label>翻转 Y 轴</label>
+    <input id="flipY" type="checkbox" checked>
+  </div>
+  <div class="btns">
+    <button id="pickBtn" title="File API：双击 file:// 打开也能用">选择图片…</button>
+    <button data-src="assets/brick.png">砖墙</button>
+    <button data-src="assets/wood.png">木纹</button>
+    <button data-src="assets/uv-grid.png">UV 校准</button>
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+  <div id="status">来源：程序生成（内置兜底）</div>
+</div>
+
+<div id="dropHint">松开鼠标，把这张图贴到立方体上</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（同第 8 课）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ==================================================================
+ * 着色器：比第 8 课多了 uTiling（UV 平铺倍数）和一个面明暗 attribute
+ * ================================================================== */
+const VERT_SRC = `
+  attribute vec3 aPos;
+  attribute vec2 aUv;
+  attribute float aShade;   // 每个面一个固定亮度，假装有方向光（真正的光照在第 9 课）
+
+  varying vec2 vUv;
+  varying float vShade;
+
+  uniform mat4 uMvp;
+  uniform float uTiling;    // UV 乘上它就能平铺 1~8 次，不用改顶点数据
+
+  void main() {
+    gl_Position = uMvp * vec4(aPos, 1.0);
+    vUv = aUv * uTiling;
+    vShade = aShade;
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+
+  varying vec2 vUv;
+  varying float vShade;
+  uniform sampler2D uTex;
+
+  void main() {
+    vec4 tex = texture2D(uTex, vUv);
+    gl_FragColor = vec4(tex.rgb * vShade, tex.a);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 几何：立方体（同第 8 课），每个顶点多带一个 aShade
+ * ================================================================== */
+const faces = [
+  [[-1,-1, 1], [ 1,-1, 1], [ 1, 1, 1], [-1, 1, 1], 1.00],   // +Z 前（正对光）
+  [[ 1,-1,-1], [-1,-1,-1], [-1, 1,-1], [ 1, 1,-1], 0.45],   // -Z 后
+  [[ 1,-1, 1], [ 1,-1,-1], [ 1, 1,-1], [ 1, 1, 1], 0.80],   // +X 右
+  [[-1,-1,-1], [-1,-1, 1], [-1, 1, 1], [-1, 1,-1], 0.62],   // -X 左
+  [[-1, 1, 1], [ 1, 1, 1], [ 1, 1,-1], [-1, 1,-1], 0.92],   // +Y 上
+  [[-1,-1,-1], [ 1,-1,-1], [ 1,-1, 1], [-1,-1, 1], 0.38]    // -Y 下
+];
+
+const vertexData = [];
+const indexData  = [];
+const UV = [[0,0], [1,0], [1,1], [0,1]];
+
+faces.forEach((face, f) => {
+  const [c0, c1, c2, c3, shade] = face;   // 前 4 项是角点，最后一项是面亮度
+  [c0, c1, c2, c3].forEach((p, i) => {
+    vertexData.push(p[0], p[1], p[2], UV[i][0], UV[i][1], shade);
+  });
+  const base = f * 4;
+  indexData.push(base, base + 1, base + 2, base, base + 2, base + 3);
+});
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertexData), gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indexData), gl.STATIC_DRAW);
+
+const STRIDE = 6 * 4;
+function bindAttrib(name, size, offsetFloats) {
+  const loc = gl.getAttribLocation(program, name);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, STRIDE, offsetFloats * 4);
+}
+bindAttrib('aPos',   3, 0);
+bindAttrib('aUv',    2, 3);
+bindAttrib('aShade', 1, 5);
+
+const uMvpLoc   = gl.getUniformLocation(program, 'uMvp');
+const uTilingLoc = gl.getUniformLocation(program, 'uTiling');
+const uTexLoc   = gl.getUniformLocation(program, 'uTex');
+
+/* ==================================================================
+ * 本课核心：把任意图片来源安全地上传成纹理
+ * ------------------------------------------------------------------
+ * WebGL1 的 POT 限制：想用 REPEAT 或 mipmap，宽高必须是 2 的幂
+ * （64, 128, 256, 512, 1024 ...）。用户随手拍的照片几乎都不是，
+ * 所以这里统一「先重采样到 512×512 再上传」——
+ * 代价是轻微模糊，换来所有纹理参数全可用，是引擎里的常见做法。
+ * （WebGL2 无此限制，见第 25 课。）
+ * ================================================================== */
+const texture = gl.createTexture();
+const anisotropic =
+    gl.getExtension('EXT_texture_filter_anisotropic')
+ || gl.getExtension('WEBGL_EXT_texture_filter_anisotropic');
+
+const state = {
+  img: null,          // 当前像素源（canvas 或 img），翻转 Y 改动时用它重新上传
+  label: '程序生成（内置兜底）',
+  pot: true,
+  mipmap: false
+};
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+function uploadSource(source, label) {
+  // 1) NPOT -> 用 2D canvas 重采样成 512×512（POT）
+  //    注意：源 canvas 一旦被跨域污染，这一步也救不了 —— 但我们只在
+  //    「用户自己选的文件」或「服务器同源图片」时走到这里。
+  let src = source;
+  const w = source.width, h = source.height;
+  const isPOT = (n) => (n & (n - 1)) === 0;
+  state.pot = isPOT(w) && isPOT(h);
+  if (!state.pot) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 512;
+    c.getContext('2d').drawImage(source, 0, 0, 512, 512);
+    src = c;
+    label += ` · ${w}×${h}→512² 重采样`;
+  } else {
+    label += ` · ${w}×${h}`;
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+
+  // 2) 上传方向的翻转开关 —— 必须在 texImage2D 之前设置才生效
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, document.getElementById('flipY').checked);
+
+  // 3) 上传像素。数据源可以是 Image / Canvas / ImageData / TypedArray
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+
+  // 4) 采样参数（上传后随时可改，无需重新上传）
+  applySamplerParams();
+  state.img = source;
+  state.label = label;
+  state.mipmap = true;
+  setStatus(`来源：${label} · mipmap ✓`, 'ok');
+}
+
+function applySamplerParams() {
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+
+  const wrapSel = document.getElementById('wrap').value;
+  const wrapMap = { repeat: gl.REPEAT, mirror: gl.MIRRORED_REPEAT, clamp: gl.CLAMP_TO_EDGE };
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapMap[wrapSel]);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapMap[wrapSel]);
+
+  const filterSel = document.getElementById('minFilter').value;
+  const minMap = { mipmap: gl.LINEAR_MIPMAP_LINEAR, linear: gl.LINEAR, nearest: gl.NEAREST };
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minMap[filterSel]);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  // 各向异性过滤：斜着看表面时减少摩尔纹/模糊。扩展对象可能不存在（老设备），判空。
+  if (anisotropic) {
+    const max = gl.getParameter(anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+    gl.texParameterf(gl.TEXTURE_2D, anisotropic.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, max));
+  }
+}
+
+function regenerateMipmap() {
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  // 我们强制 POT 了，所以总能生成。若是 NPOT 且没有重采样，
+  // generateMipmap 会报 gl.INVALID_OPERATION 且 mipmap 过滤会黑屏。
+  gl.generateMipmap(gl.TEXTURE_2D);
+}
+
+/* ==================================================================
+ * 图片来源 1：程序化兜底（保证双击打开第一眼就有东西看）
+ * ================================================================== */
+function makeFallbackCanvas() {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  const cell = 32;
+  for (let y = 0; y < S / cell; y++)
+    for (let x = 0; x < S / cell; x++) {
+      ctx.fillStyle = (x + y) % 2 ? '#1c2430' : '#2b3646';
+      ctx.fillRect(x * cell, y * cell, cell, cell);
+    }
+  ctx.fillStyle = '#2f81f7';
+  ctx.beginPath(); ctx.arc(S / 2, S / 2, S * 0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#7ee787';
+  ctx.fillRect(8, 8, 28, 28);
+  ctx.fillStyle = '#0b0e14';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText('UL', 9, 28);
+  return c;
+}
+
+const fallback = makeFallbackCanvas();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, fallback);
+applySamplerParams();
+regenerateMipmap();
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.uniform1i(uTexLoc, 0);
+
+/* ==================================================================
+ * 图片来源 2：File API（选择文件 / 拖拽）—— file:// 双击也能用！
+ * ------------------------------------------------------------------
+ * 原理：用户主动选中的文件拥有「同源豁免」。File → URL.createObjectURL
+ * 得到的 blob: 地址与页面同源，像素不污染，texImage2D 合法。
+ * ================================================================== */
+function loadFile(file) {
+  if (!file || !file.type.startsWith('image/')) {
+    setStatus('这不是图片文件：' + (file ? file.type || file.name : '未知'), 'err');
+    return;
+  }
+  const url = URL.createObjectURL(file);      // blob: 地址，注意用完 revoke
+  const img = new Image();
+  img.onload = () => {
+    uploadSource(img, `拖入/选择：${file.name}`);
+    regenerateMipmap();
+    URL.revokeObjectURL(url);                 // 上传完成后即可释放，GPU 里已有副本
+  };
+  img.onerror = () => { setStatus('图片解码失败：' + file.name, 'err'); URL.revokeObjectURL(url); };
+  img.src = url;
+}
+
+document.getElementById('pickBtn').addEventListener('click', () => {
+  document.getElementById('fileInput').click();
+});
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  loadFile(e.target.files[0]);
+  e.target.value = '';   // 允许连续选择同一文件
+});
+
+// 拖拽：dragover 必须阻止默认行为，否则浏览器会直接打开这张图
+const dropHint = document.getElementById('dropHint');
+window.addEventListener('dragover', (e) => { e.preventDefault(); dropHint.classList.add('show'); });
+window.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget === null) dropHint.classList.remove('show');
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropHint.classList.remove('show');
+  loadFile(e.dataTransfer.files[0]);
+});
+
+/* ==================================================================
+ * 图片来源 3：相对路径 <img>（assets/ 示例图）—— 需要 http 服务器
+ * ------------------------------------------------------------------
+ * file:// 双击打开时：img 能"加载成功"（onload 触发、能画出来），
+ * 但像素被同源策略锁定，texImage2D 抛 SecurityError。
+ * 所以这里把两种失败（onerror / SecurityError）都接住，给用户明确提示。
+ * ================================================================== */
+function loadExample(src) {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      uploadSource(img, src);
+      regenerateMipmap();
+    } catch (err) {
+      // file:// 下的必经之路：SecurityError
+      setStatus(`「${src}」像素被跨域策略拦截（${err.name}）。\n` +
+        '双击打开时读不了本地文件的像素：请用「选择图片/拖拽」，或在本目录运行 python -m http.server 8000 后访问 localhost:8000。', 'err');
+    }
+  };
+  img.onerror = () => {
+    setStatus(`找不到 ${src}（双击 file:// 时相对路径也可能被拦截）——用「选择图片」或拖拽一张图进来。`, 'err');
+  };
+  img.src = src;
+}
+document.querySelectorAll('.panel button[data-src]').forEach((btn) => {
+  btn.addEventListener('click', () => loadExample(btn.dataset.src));
+});
+
+/* ==================================================================
+ * 控件绑定
+ * ================================================================== */
+document.getElementById('minFilter').addEventListener('change', applySamplerParams);
+document.getElementById('wrap').addEventListener('change', applySamplerParams);
+
+document.getElementById('tiling').addEventListener('input', (e) => {
+  document.getElementById('tilingVal').textContent = e.target.value;
+});
+
+// 翻转 Y 影响的是「上传那一刻」的像素方向，必须重新 texImage2D
+document.getElementById('flipY').addEventListener('change', () => {
+  if (state.img) {
+    uploadSource(state.img, state.label.replace(/ · .*$/, ''));
+    regenerateMipmap();
+  }
+});
+
+/* ==================================================================
+ * 渲染循环（同第 8 课 + uTiling）
+ * ================================================================== */
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(60 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt([0, 1.2, 4.6], [0, 0, 0], [0, 1, 0]);
+  const model = M4.chain(M4.rotateY(t * 0.5), M4.rotateX(t * 0.32));
+
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+  gl.uniform1f(uTilingLoc, +document.getElementById('tiling').value);
+  gl.drawElements(gl.TRIANGLES, indexData.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 三种图片来源的适用场景（本课实测结论）：
+ *
+ *  ┌────────────────────────┬──────────┬──────────┬──────────────────┐
+ *  │ 方式                    │ file://  │ http://  │ 适用              │
+ *  ├────────────────────────┼──────────┼──────────┼──────────────────┤
+ *  │ 拖拽 / <input type=file>│  ✓       │  ✓       │ 用户自己的图      │
+ *  │ 相对路径 <img src=...>  │  ✗ 污染  │  ✓       │ 项目自带素材      │
+ *  │ Canvas 程序生成（08课） │  ✓       │  ✓       │ 无素材的兜底      │
+ *  └────────────────────────┴──────────┴──────────┴──────────────────┘
+ *
+ * 原理：file:// 页面被视为「不透明源」，任何本地文件都算跨域；
+ * img 标签可以「展示」跨域图（和网页里嵌外链图片一样），但一旦
+ * 想读像素（texImage2D / getImageData），就会被 canvas 污染机制拦截。
+ * 起服务器（python -m http.server）后页面与图片同源，限制消失。
+ *
+ * 进阶：想给立方体「每个面贴不同的图」？下一课 08c-face-textures.html
+ * 演示多纹理对象管理 + 分面绘制。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

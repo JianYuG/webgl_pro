@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>13 · 番外：纯片元着色器的光线步进</title>
+<!--
+  ============================================================
+  第 13 课（番外）：不需要一个顶点，也能渲染 3D
+  ------------------------------------------------------------
+  前面 12 课都在「造几何 -> 变换 -> 光栅化」。这一课走另一条路：
+
+  整个场景只由片元着色器算出来，几何是不存在的，
+  你看到的是「每个像素朝某个方向射一条光线，走多少步会撞到物体」。
+
+  这叫 Ray Marching（体积光线步进），用 SDF（有符号距离场）描述形状。
+  Shadertoy 上的作品几乎全是这个套路。
+
+  本课新知识点：
+    1. SDF：用一个函数描述「点到表面的距离」
+    2. 光线步进：沿视线前进「距离」那么多，逐步逼近表面
+    3. 用有限差分求法线
+    4. 为什么这类特效在 WebGL 里必须用 highp
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 13 · BONUS</div>
+  <h1>番外：纯片元着色器的光线步进</h1>
+  <p>整个画面只有一个全屏四边形，物体完全不存在 —— 全靠每个像素自己算出来。</p>
+  <div class="tip">96 步迭代 × 每个像素，笔记本风扇会响是正常的。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: false });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ------------------------------------------------------------------
+ * 顶点着色器：只做一件事 —— 把四边形的 UV 传给片元着色器
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec2 aPos;
+  varying vec2 vUv;
+  void main() {
+    vUv = aPos * 0.5 + 0.5;      // [-1,1] -> [0,1]
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  // 光线步进对精度极敏感，必须 highp（移动端要检查是否支持）
+  precision highp float;
+
+  varying vec2 vUv;
+
+  uniform vec2  uResolution;
+  uniform float uTime;
+
+  /* ---------- 1. 形状：用 SDF 描述，而不是顶点 ---------- */
+
+  mat3 rotY(float a) {
+    float c = cos(a), s = sin(a);
+    // GLSL 的 mat3 构造函数按「列」填充
+    return mat3(c, 0.0, -s,
+                0.0, 1.0, 0.0,
+                s, 0.0, c);
+  }
+
+  // 圆环的 SDF：把点投到「距离中心轴的半径」和「高度」构成的 2D 平面上
+  float sdTorus(vec3 p, vec2 t) {
+    vec2 q = vec2(length(p.xz) - t.x, p.y);
+    return length(q) - t.y;
+  }
+
+  float sdSphere(vec3 p, float r) {
+    return length(p) - r;
+  }
+
+  // 平滑并集：让两个形状像水滴一样融合，k 越大越"黏"
+  float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+  }
+
+  float map(vec3 p) {
+    vec3 q = rotY(uTime * 0.5) * p;
+    float torus  = sdTorus(q, vec2(1.05, 0.34));
+    float sphere = sdSphere(q, 0.62 + 0.06 * sin(uTime * 1.6));
+    return smin(torus, sphere, 0.45);
+  }
+
+  /* ---------- 2. 法线：对 SDF 做有限差分 ---------- */
+  // 表面法线 = 距离场变化最快的方向 = 梯度方向。
+  // 用 3 次「中心差分」近似，比解析求导通用得多。
+  vec3 calcNormal(vec3 p) {
+    vec2 e = vec2(0.0015, 0.0);
+    return normalize(vec3(
+      map(p + e.xyy) - map(p - e.xyy),
+      map(p + e.yxy) - map(p - e.yxy),
+      map(p + e.yyx) - map(p - e.yyx)
+    ));
+  }
+
+  /* ---------- 3. 软阴影：沿光线再走一遍场景 ---------- */
+  float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
+    float res = 1.0;
+    float t = mint;
+    for (int i = 0; i < 32; i++) {
+      float h = map(ro + rd * t);
+      if (h < 0.001) return 0.0;
+      res = min(res, k * h / t);
+      t += clamp(h, 0.02, 0.4);
+      if (t > maxt) break;
+    }
+    return clamp(res, 0.0, 1.0);
+  }
+
+  void main() {
+    // 屏幕坐标 -> 以画面中心为原点、按宽高比修正
+    vec2 uv = (gl_FragCoord.xy * 2.0 - uResolution) / uResolution.y;
+
+    /* 相机：位置固定，稍微左右摆动；朝 -Z 看 */
+    vec3 ro = vec3(sin(uTime * 0.3) * 0.6, 0.65 + sin(uTime * 0.5) * 0.15, 3.6);
+    vec3 ta = vec3(0.0, 0.0, 0.0);
+
+    // 构造相机基向量（右、上、前）。顺序不能换：
+    // right = fwd × worldUp，up = right × fwd，否则画面会左右镜像。
+    vec3 worldUp = vec3(0.0, 1.0, 0.0);
+    vec3 fwd   = normalize(ta - ro);
+    vec3 right = normalize(cross(fwd, worldUp));
+    vec3 up    = cross(right, fwd);
+    vec3 rd    = normalize(uv.x * right + uv.y * up + 1.6 * fwd);
+
+    /* ---------- 4. 光线步进：一步步逼近表面 ---------- */
+    float t = 0.0;
+    float hit = 0.0;
+    for (int i = 0; i < 96; i++) {
+      vec3 p = ro + rd * t;
+      float d = map(p);
+      if (d < 0.001) { hit = 1.0; break; }   // 撞上了
+      t += d;                                 // 安全前进：这个距离内一定不会撞
+      if (t > 20.0) break;                    // 跑太远，当作天空
+    }
+
+    /* ---------- 5. 着色 ---------- */
+    vec3 col = vec3(0.02, 0.035, 0.06);
+
+    // 背景渐变（模拟天光）
+    col += vec3(0.10, 0.16, 0.28) * smoothstep(-0.4, 0.9, rd.y);
+
+    if (hit > 0.5) {
+      vec3 p = ro + rd * t;
+      vec3 n = calcNormal(p);
+
+      vec3 lightDir = normalize(vec3(0.7, 0.9, 0.4));
+
+      // 环境光遮蔽的廉价近似：往上偏一点再采样，凹处自然变暗
+      float ao = clamp(map(p + n * 0.08) * 6.0, 0.0, 1.0);
+
+      float diff = max(dot(n, lightDir), 0.0);
+      float sh   = softShadow(p + n * 0.01, lightDir, 0.02, 8.0, 12.0);
+
+      vec3 V = -rd;
+      vec3 H = normalize(lightDir + V);
+      float spec = pow(max(dot(n, H), 0.0), 48.0);
+
+      float fres = pow(1.0 - max(dot(n, V), 0.0), 4.0);
+
+      vec3 base = vec3(0.22, 0.55, 0.95);
+      vec3 lit  = base * (0.25 + 0.9 * diff * sh) * (0.5 + 0.5 * ao);
+      lit += vec3(1.0, 0.95, 0.85) * spec * sh * 0.9;
+      lit += vec3(0.35, 0.7, 1.0) * fres * 0.55;
+
+      // 指数雾：远处融入背景，增强空间感
+      float fog = 1.0 - exp(-0.02 * t * t * 0.25);
+      col = mix(lit, col, fog);
+    }
+
+    // 轻微 gamma + 暗角
+    col = pow(col, vec3(1.0 / 2.2));
+    float vig = 1.0 - 0.35 * dot(uv * 0.55, uv * 0.55);
+    col *= vig;
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+// 两个三角形拼成的全屏四边形（用 TRIANGLES 而不是 TRIANGLE_STRIP：
+// 个别驱动对 4 顶点 strip 的裁剪有怪癖，显式 6 顶点最稳妥）
+const quad = new Float32Array([
+  -1, -1,   1, -1,   1,  1,     // 第一个三角形
+  -1, -1,   1,  1,  -1,  1      // 第二个三角形
+]);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+const uTimeLoc       = gl.getUniformLocation(program, 'uTime');
+
+/* ------------------------------------------------------------------
+ * 性能控制：光线步进按像素算 96 步，全屏就是「宽度×高度×96」次距离函数求值。
+ * 高分屏上建议降低渲染分辨率（这里用 0.75 倍，CSS 拉伸回来，肉眼看不出差别）。
+ * ------------------------------------------------------------------ */
+const RENDER_SCALE = 0.75;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2) * RENDER_SCALE;
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+
+  resize();
+  gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+  gl.uniform1f(uTimeLoc, clock);
+
+  // 不需要 clear：全屏四边形把每个像素都覆盖了
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 把这里的东西搬进 Shadertoy 几乎零成本（换个入口变量即可）。
+ * 继续玩下去的方向：
+ *   - 在 map() 里加棋盘地面：p.y + 1.0，或用 floor 取棋盘格
+ *   - 反射：在循环里再射一条反射光线，最多 2~3 次
+ *   - 体积雾：沿途累加 density，做出光束
+ *   - domain repetition：把空间折叠成无限重复的结构（成本极低）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

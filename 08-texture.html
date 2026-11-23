@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · 纹理贴图：UV、采样与 mipmap</title>
+<!--
+  ============================================================
+  第 8 课：纹理
+  ------------------------------------------------------------
+  本课新知识点：
+    1. UV 坐标（0~1 的二维坐标）如何把图片「包」到几何体上
+    2. 纹理参数：WRAP（越界怎么办）、FILTER（缩放怎么取色）、mipmap
+    3. UNPACK_FLIP_Y_WEBGL —— 图片上下颠倒的经典坑
+    4. 为什么本例的纹理由 Canvas 程序生成，而不是加载一张 jpg
+
+  重要：直接用 file:// 双击打开时，加载外部图片会因为跨域策略
+        被浏览器拒绝（本地文件被视为不同源）。纹理源改用 <canvas>
+        就完全绕开了这个问题，所以这个例子可以直接双击运行。
+        （详见文末注释）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 08</div>
+  <h1>纹理贴图：UV、采样与 mipmap</h1>
+  <p>纹理由 2D Canvas 现场绘制（棋盘 + 标记），再上传给 GPU。立方体每个面贴一张。</p>
+  <div class="tip">注意左上角的字母方向 —— 如果没做 Y 翻转，贴图会上下颠倒。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（同第 7 课，略去注释）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ==================================================================
+ * 着色器：这次多了一个 vec2 的 UV attribute 和一个 sampler2D
+ * ================================================================== */
+const VERT_SRC = `
+  attribute vec3 aPos;
+  attribute vec2 aUv;
+  varying vec2 vUv;
+
+  uniform mat4 uMvp;
+
+  void main() {
+    gl_Position = uMvp * vec4(aPos, 1.0);
+    vUv = aUv;          // UV 会被插值，所以三角形内部的纹理坐标是连续的
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+
+  varying vec2 vUv;
+  uniform sampler2D uTex;   // 采样器：指向某个纹理单元，不是纹理本身
+
+  void main() {
+    // texture2D 返回该 UV 位置的颜色（双线性插值过的）
+    vec4 tex = texture2D(uTex, vUv);
+    gl_FragColor = tex;
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 几何：24 个顶点（6 个面 × 4），每个顶点带 position + uv
+ * ----------------------------------------------------------------
+ * 为什么不用第 7 课的 8 个顶点？因为每个面需要不同的 UV 映射，
+ * 而「共享顶点」要求所有 attribute 都相同。位置相同、UV 不同 → 不能共享。
+ * ================================================================== */
+const faces = [
+  // 每个面的 4 个角：从外部看逆时针；UV 依次是 (0,0) (1,0) (1,1) (0,1)
+  [[-1,-1, 1], [ 1,-1, 1], [ 1, 1, 1], [-1, 1, 1]],   // +Z 前
+  [[ 1,-1,-1], [-1,-1,-1], [-1, 1,-1], [ 1, 1,-1]],   // -Z 后
+  [[ 1,-1, 1], [ 1,-1,-1], [ 1, 1,-1], [ 1, 1, 1]],   // +X 右
+  [[-1,-1,-1], [-1,-1, 1], [-1, 1, 1], [-1, 1,-1]],   // -X 左
+  [[-1, 1, 1], [ 1, 1, 1], [ 1, 1,-1], [-1, 1,-1]],   // +Y 上
+  [[-1,-1,-1], [ 1,-1,-1], [ 1,-1, 1], [-1,-1, 1]]    // -Y 下
+];
+
+const vertexData = [];   // [x,y,z,u,v] × 24
+const indexData  = [];
+const UV = [[0,0], [1,0], [1,1], [0,1]];
+
+faces.forEach((corners, f) => {
+  corners.forEach((p, i) => {
+    vertexData.push(p[0], p[1], p[2], UV[i][0], UV[i][1]);
+  });
+  const base = f * 4;
+  indexData.push(base, base + 1, base + 2, base, base + 2, base + 3);
+});
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertexData), gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indexData), gl.STATIC_DRAW);
+
+const STRIDE = 5 * 4;
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+const aUvLoc  = gl.getAttribLocation(program, 'aUv');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, STRIDE, 0);
+gl.enableVertexAttribArray(aUvLoc);
+gl.vertexAttribPointer(aUvLoc, 2, gl.FLOAT, false, STRIDE, 3 * 4);
+
+const uMvpLoc = gl.getUniformLocation(program, 'uMvp');
+const uTexLoc = gl.getUniformLocation(program, 'uTex');
+
+/* ==================================================================
+ * 生成纹理贴图（用 2D Canvas 画一张 256×256 的图）
+ * ================================================================== */
+function makeTextureCanvas() {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+
+  // 棋盘底纹：方便一眼看出 UV 是否被拉伸 / 有没有错位
+  const cell = 32;
+  for (let y = 0; y < S / cell; y++) {
+    for (let x = 0; x < S / cell; x++) {
+      ctx.fillStyle = (x + y) % 2 ? '#1c2430' : '#2b3646';
+      ctx.fillRect(x * cell, y * cell, cell, cell);
+    }
+  }
+
+  // 中心圆 + 十字，用来判断方向
+  ctx.fillStyle = '#2f81f7';
+  ctx.beginPath();
+  ctx.arc(S / 2, S / 2, S * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255,255,255,.55)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(S / 2, 0); ctx.lineTo(S / 2, S);
+  ctx.moveTo(0, S / 2); ctx.lineTo(S, S / 2);
+  ctx.stroke();
+
+  // 左上角标记：如果显示在左下角，说明 Y 方向反了
+  ctx.fillStyle = '#7ee787';
+  ctx.fillRect(8, 8, 28, 28);
+  ctx.fillStyle = '#0b0e14';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText('UL', 9, 28);   // Upper-Left
+
+  return c;
+}
+
+const texSource = makeTextureCanvas();
+
+const texture = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, texture);
+
+/* --- 关键坑：Canvas/Image 的行序是「从上到下」，而 GL 的 UV 原点在左下 ---
+ * gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true) 让上传时自动上下翻转。
+ * 少了这一句，贴图会上下颠倒（本图的 "UL" 会跑到左下）。
+ */
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+gl.texImage2D(
+  gl.TEXTURE_2D,
+  0,                 // mip 层级，0 表示原图
+  gl.RGBA,           // 内部格式
+  gl.RGBA,           // 数据格式
+  gl.UNSIGNED_BYTE,  // 数据类型
+  texSource          // 数据源：可以是 Canvas / Image / ImageData / TypedArray
+);
+
+/* --- 纹理参数 ---
+ * WRAP_S / WRAP_T：UV 超出 [0,1] 时的行为
+ *   REPEAT          平铺（要求纹理尺寸是 2 的幂）
+ *   CLAMP_TO_EDGE   拉边缘像素（NPOT 纹理只能用这个）
+ *   MIRRORED_REPEAT 镜像平铺
+ *
+ * MIN_FILTER：纹理被缩小（远处）时的采样方式。
+ *   一定要用 MIPMAP 系列，否则远处会闪烁/摩尔纹。
+ *   MAG_FILTER：放大时用，通常 LINEAR 就够。
+ */
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+// 生成 mipmap 链（256 是 2 的幂，可以直接生成；NPOT 会报 INVALID_OPERATION）
+gl.generateMipmap(gl.TEXTURE_2D);
+
+// sampler2D 的值是「纹理单元编号」，不是纹理 ID。
+// 只有一个纹理时绑到 unit 0 即可，多纹理时才需要 activateTexture 切换。
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, texture);
+gl.uniform1i(uTexLoc, 0);   // 告诉着色器：uTex 用 0 号纹理单元
+
+/* ==================================================================
+ * 渲染
+ * ================================================================== */
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(60 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt([0, 1.2, 4.6], [0, 0, 0], [0, 1, 0]);
+  const model = M4.chain(M4.rotateY(t * 0.6), M4.rotateX(t * 0.35));
+
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+  gl.drawElements(gl.TRIANGLES, indexData.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 如果要加载真实图片（比如 assets/wood.jpg）：
+ *
+ *   const img = new Image();
+ *   img.onload = () => {
+ *     gl.bindTexture(gl.TEXTURE_2D, texture);
+ *     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+ *     gl.generateMipmap(gl.TEXTURE_2D);   // 图片不是 2 的幂时必须跳过这一步
+ *   };
+ *   img.src = 'assets/wood.jpg';
+ *
+ * 用 file:// 直接打开时，浏览器会把该图片视为跨域资源，
+ * 除非服务器返回 CORS 头 —— 这就是教程里的例子常常「双击打不开」的原因。
+ * 解决办法二选一：
+ *   1) 起一个本地服务器：在目录里执行 `python -m http.server 8000`
+ *   2) 像本例一样用 Canvas / TypedArray 程序化生成纹理
+ *
+ *   想亲手把本地图片（拖拽/选图）贴上去？下一课就是：
+ *   「08b-local-image-texture.html」把三种来源的适用场景讲透了。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

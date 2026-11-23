@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>23 · 文字渲染：纹理图集与动态文本</title>
+<!--
+  ============================================================
+  第 23 课：文字渲染（Text / Font Atlas）
+  ------------------------------------------------------------
+  GPU 没有文字这种东西 —— 文字是「一小块贴图的四边形」。
+  把所有可能用到的字符预先画到一张大纹理（图集 atlas）上，
+  渲染文字 = 渲染一排 UV 各异的小四边形。
+
+  本课新知识点：
+    1. 纹理图集：N 个字符挤进一张纹理，UV 定位每个字符
+    2. canvas 2D 的 measureText / fillText 当作「字体光栅化器」
+    3. 半像素内缩（half-texel inset）：防止图集渗色（bleeding）
+    4. 动态文本：每次文字变化重排四边形 + bufferSubData
+    5. 文字阴影：同一批几何画两遍（偏移 + 变色）
+
+  游戏里成千上万的伤害数字、聊天框、FPS 计数器，底层都是这一套。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 23</div>
+  <h1>文字渲染：纹理图集与动态文本</h1>
+  <p>标题和 FPS 计数器都是 WebGL 四边形，字符来自一张 canvas 光栅化的图集。</p>
+  <div class="tip">FPS 数字每帧变化 —— 动态重排 + bufferSubData</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 正交投影：像素坐标直接进着色器
+ *   x: [0, width]  y: [0, height]（顶部为 0，和 DOM 一致）
+ * ================================================================== */
+function ortho2D(w, h) {
+  // 把像素坐标映射到裁剪空间：x/w*2-1, 1-y/h*2-1
+  return new Float32Array([
+    2/w, 0, 0, 0,
+    0, -2/h, 0, 0,      // y 取负：屏幕坐标向下，裁剪空间向上
+    0, 0, 1, 0,
+    -1, 1, 0, 1
+  ]);
+}
+
+/* ==================================================================
+ * 文字程序：位置（像素）+ UV（图集内）+ 颜色
+ * ================================================================== */
+const textProgram = createProgram(`
+  attribute vec2 aPos;     // 像素坐标
+  attribute vec2 aUv;      // 图集 UV
+  uniform mat4 uOrtho;
+  varying vec2 vUv;
+  void main() {
+    vUv = aUv;
+    gl_Position = uOrtho * vec4(aPos, 0.0, 1.0);
+  }
+`, `
+  precision mediump float;
+  varying vec2 vUv;
+  uniform sampler2D uAtlas;
+  uniform vec4 uColor;      // rgb + alpha（阴影/正文用不同颜色画两遍）
+  void main() {
+    float a = texture2D(uAtlas, vUv).a;   // 字形存在 alpha 通道
+    gl_FragColor = vec4(uColor.rgb, a * uColor.a);
+  }
+`);
+gl.useProgram(textProgram);
+
+/* ==================================================================
+ * 生成字符图集
+ * ----------------------------------------------------------------
+ * canvas 2D 就是现成的字体光栅化器：fillText 画上去，
+ * 再用 measureText 拿每个字符的宽度（排版必需）。
+ * 字符画进 alpha 通道，颜色无所谓 —— 着色器里自己上色。
+ * ================================================================== */
+const CHARS = ' !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~·';
+const COLS = 16;
+const CELL = 64;             // 单元格边距充足，避免字形互相踩边
+const FONT_PX = 44;
+const ROWS = Math.ceil(CHARS.length / COLS);
+
+const atlasCanvas = document.createElement('canvas');
+atlasCanvas.width = COLS * CELL;
+atlasCanvas.height = ROWS * CELL;
+const actx = atlasCanvas.getContext('2d');
+
+const charInfo = {};          // ch -> { x0, y0, w, h, uw, vh }（图集内的像素/UV）
+actx.font = `${FONT_PX}px "Consolas", "Microsoft YaHei", monospace`;
+actx.textBaseline = 'top';
+actx.fillStyle = '#fff';
+
+[...CHARS].forEach((ch, i) => {
+  const cx = (i % COLS) * CELL;
+  const cy = Math.floor(i / COLS) * CELL;
+  const m = actx.measureText(ch);
+  // 实际字形边界（actualBoundingBox 系列在老浏览器可能缺失，做个兜底）
+  const w = Math.ceil(m.width);
+  const h = FONT_PX;
+  actx.fillText(ch, cx + 6, cy + 8);
+  charInfo[ch] = {
+    x: cx, y: cy, w, h,
+    u0: cx / atlasCanvas.width, v0: cy / atlasCanvas.height,
+    u1: (cx + w + 12) / atlasCanvas.width, v1: (cy + h + 16) / atlasCanvas.height
+  };
+});
+
+const atlasTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+// 图集必须 CLAMP + 不 mipmap：mipmap 会把相邻字符的颜色混进来（渗色）
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+/* ==================================================================
+ * 文字排版 -> 四边形顶点
+ * ----------------------------------------------------------------
+ * 动态文本的工作流：字符串变 -> 重新生成顶点数组 -> bufferSubData。
+ * 四边形数量 = 字符数 × 6 顶点。布局用「累计宽度」，
+ * 居中就是先算总宽再平移起点。
+ * ================================================================== */
+const MAX_CHARS = 128;
+const verts = new Float32Array(MAX_CHARS * 6 * 4);   // x,y,u,v 交错
+
+function layoutText(str, centerX, centerY, scale) {
+  let total = 0;
+  for (const ch of str) total += (charInfo[ch]?.w ?? CELL * 0.5) * scale;
+  let penX = centerX - total / 2;
+  const penY = centerY - (FONT_PX * scale) / 2;
+  let n = 0;
+
+  for (const ch of str) {
+    const info = charInfo[ch];
+    if (!info) { penX += CELL * 0.5 * scale; continue; }  // 图集外字符跳过
+    const w = info.w * scale, h = FONT_PX * scale;
+
+    // 半像素内缩：UV 往格子中心收一点，线性采样就不会沾到邻居
+    const eps = 0.5 / atlasCanvas.width;
+    const epy = 0.5 / atlasCanvas.height;
+    const u0 = info.u0 + eps, u1 = info.u1 - eps;
+    const v0 = info.v0 + epy, v1 = info.v1 - epy;
+
+    // 两个三角形、6 个顶点（x,y,u,v）
+    const quad = [
+      penX,     penY,     u0, v0,
+      penX + w, penY,     u1, v0,
+      penX + w, penY + h, u1, v1,
+      penX,     penY,     u0, v0,
+      penX + w, penY + h, u1, v1,
+      penX,     penY + h, u0, v1
+    ];
+    verts.set(quad, n * 24);
+    n++;
+    penX += w;
+  }
+  return n;    // 实际写入的字符数
+}
+
+const textVbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, textVbo);
+gl.bufferData(gl.ARRAY_BUFFER, verts.byteLength, gl.DYNAMIC_DRAW);
+
+const aPos = gl.getAttribLocation(textProgram, 'aPos');
+const aUv  = gl.getAttribLocation(textProgram, 'aUv');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+gl.enableVertexAttribArray(aUv);
+gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+
+const uOrtho = gl.getUniformLocation(textProgram, 'uOrtho');
+const uAtlas = gl.getUniformLocation(textProgram, 'uAtlas');
+const uColor = gl.getUniformLocation(textProgram, 'uColor');
+gl.uniform1i(uAtlas, 0);
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);   // 文字 = 标准透明混合
+gl.disable(gl.DEPTH_TEST);
+
+/* ==================================================================
+ * 3D 部分：一个旋转立方体当前景，衬托「HUD 文字」
+ * ================================================================== */
+const cubeProgram = createProgram(`
+  attribute vec3 aPos;
+  uniform mat4 uMvp;
+  varying vec3 vColor;
+  void main() {
+    vColor = normalize(aPos) * 0.5 + 0.5;
+    gl_Position = uMvp * vec4(aPos, 1.0);
+  }
+`, `
+  precision mediump float;
+  varying vec3 vColor;
+  void main() {
+    gl_FragColor = vec4(vColor * 0.55, 1.0);
+  }
+`);
+const cubePos = new Float32Array([
+  -1,-1, 1,  1,-1, 1,  1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,  1,-1,-1,  1, 1,-1,  -1, 1,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,   1,5,6, 1,6,2,
+  4,0,3, 4,3,7,   3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+const cubeVbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cubeVbo);
+gl.bufferData(gl.ARRAY_BUFFER, cubePos, gl.STATIC_DRAW);
+const cubeIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cubeIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeIdx, gl.STATIC_DRAW);
+
+function drawCube(t, w, h) {
+  gl.useProgram(cubeProgram);
+  gl.disable(gl.BLEND);
+  gl.enable(gl.DEPTH_TEST);
+
+  const aPosC = gl.getAttribLocation(cubeProgram, 'aPos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeVbo);
+  gl.enableVertexAttribArray(aPosC);
+  gl.vertexAttribPointer(aPosC, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cubeIbo);
+
+  const c = Math.cos, s = Math.sin, r = t * 0.6;
+  // 手拼 mvp（省掉矩阵库：平移 + 旋转Y + 旋转X + 透视）
+  const f = 1 / Math.tan(0.44), aspect = w / h;
+  const rotY = [c(r), 0, -s(r), 0,  0, 1, 0, 0,  s(r), 0, c(r), 0,  0, 0, -3.6, 1];
+  const rx = t * 0.42, cx2 = Math.cos(rx), sx = Math.sin(rx);
+  const rotX = [1, 0, 0, 0,  0, cx2, sx, 0,  0, -sx, cx2, 0,  0, 0, 0, 1];
+  const mul = (a, b) => {
+    const o = new Float32Array(16);
+    for (let cc = 0; cc < 4; cc++) for (let rr = 0; rr < 4; rr++)
+      o[cc*4+rr] = a[rr]*b[cc*4] + a[4+rr]*b[cc*4+1] + a[8+rr]*b[cc*4+2] + a[12+rr]*b[cc*4+3];
+    return o;
+  };
+  const proj = [f/aspect,0,0,0, 0,f,0,0, 0,0,(100+0.1)/(0.1-100),-1, 0,0,2*100*0.1/(0.1-100),0];
+  gl.uniformMatrix4fv(gl.getUniformLocation(cubeProgram, 'uMvp'), false, mul(proj, mul(rotY, rotX)));
+  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+
+  gl.disable(gl.DEPTH_TEST);   // 文字覆盖在最上，不用深度
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0, frames = 0, fpsTimer = 0, fpsText = 'FPS --';
+
+function render(now) {
+  if (last === null) last = now;
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  clock += dt;
+
+  // FPS 统计：每 0.25s 更新一次字符串 -> 触发一次重新排版
+  frames++; fpsTimer += dt;
+  if (fpsTimer >= 0.25) {
+    fpsText = 'FPS ' + Math.round(frames / fpsTimer);
+    frames = 0; fpsTimer = 0;
+  }
+
+  resize();
+  const w = canvas.width, h = canvas.height;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  gl.clearColor(0.04, 0.05, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  drawCube(clock, w, h);
+
+  /* ---- 文字 pass ---- */
+  gl.useProgram(textProgram);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniformMatrix4fv(uOrtho, false, ortho2D(w, h));
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, textVbo);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(aUv);
+  gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+
+  const drawText = (str, cx, cy, scale, color) => {
+    const n = layoutText(str, cx, cy, scale);
+    if (!n) return;
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts.subarray(0, n * 24));
+    gl.uniform4fv(uColor, color);
+    gl.drawArrays(gl.TRIANGLES, 0, n * 6);
+  };
+
+  // 标题：先画黑色阴影（偏移 3px），再画正文 —— 阴影就是「再画一遍」
+  drawText('WebGL Text Atlas!', w/2, h*0.16, 1.6, [0, 0, 0, 0.55]);
+  // 微调阴影位置：layoutText 以中心对齐，这里直接用同坐标 + 色差近似
+  drawText('WebGL Text Atlas!', w/2, h*0.16 - 3, 1.6, [1.0, 0.98, 0.9, 1.0]);
+  // 动态 FPS：字符串每 0.25s 变一次，四边形跟着重排
+  drawText(fpsText, w/2, h*0.28, 1.0, [0.49, 0.65, 1.0, 0.9]);
+  drawText('0123456789 · ABC · abc', w/2, h*0.36, 0.8, [0.55, 0.60, 0.66, 0.85]);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 文字渲染的进阶话题：
+ *   SDF 字体（Valve 论文）—— 距离场贴图，一个字形任意缩放都锐利，
+ *     msdf-bmfont / font-meshup 可直接生成
+ *   中文/大字符集 —— 图集按需缓存（只放出现过的字），超了就翻页
+ *   排版 —— 换行、字距（kerning）、emoji 的复杂成形（HarfBuzz 领域）
+ *   ClearType 式次像素渲染 —— canvas 光栅化时已含彩色边缘，注意混合
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

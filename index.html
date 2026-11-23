@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebGL 入门教程 · 33 个可直接运行的例子</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #080a10;
+    --panel: #0f141d;
+    --panel-2: #131a25;
+    --line: rgba(255,255,255,.08);
+    --text: #e6edf3;
+    --dim: #8b98a8;
+    --blue: #58a6ff;
+    --green: #7ee787;
+    --purple: #bc8cff;
+    --amber: #f0b429;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background:
+      radial-gradient(1200px 700px at 15% -10%, rgba(88,166,255,.13), transparent 60%),
+      radial-gradient(900px 600px at 95% 0%, rgba(188,140,255,.10), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.7 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+    padding: 64px 24px 80px;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+
+  header { margin-bottom: 48px; }
+  .eyebrow {
+    display: inline-block;
+    font: 600 11px/1 ui-monospace, Consolas, monospace;
+    letter-spacing: 2px; color: var(--blue);
+    border: 1px solid rgba(88,166,255,.35);
+    background: rgba(88,166,255,.10);
+    padding: 7px 12px; border-radius: 999px; margin-bottom: 20px;
+  }
+  h1 { font-size: clamp(30px, 4.6vw, 46px); font-weight: 700; letter-spacing: -.5px; line-height: 1.15; }
+  h1 em {
+    font-style: normal;
+    background: linear-gradient(100deg, #58a6ff, #7ee787 55%, #bc8cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lede { margin-top: 14px; max-width: 720px; color: var(--dim); font-size: 15px; }
+  .lede b { color: var(--text); font-weight: 600; }
+
+  .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+  .chip {
+    font: 500 12px/1 ui-monospace, Consolas, monospace;
+    color: var(--dim); border: 1px solid var(--line);
+    background: rgba(255,255,255,.03);
+    padding: 8px 11px; border-radius: 8px;
+  }
+
+  h2 {
+    font-size: 13px; font-weight: 600; letter-spacing: 1.6px; text-transform: uppercase;
+    color: var(--dim); margin: 44px 0 16px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; }
+
+  a.card {
+    position: relative; display: block; text-decoration: none; color: inherit;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 18px 16px; overflow: hidden;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  a.card::before {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
+    background: var(--accent, var(--blue)); opacity: .55;
+    transition: opacity .18s ease;
+  }
+  a.card:hover {
+    transform: translateY(-3px);
+    border-color: rgba(255,255,255,.18);
+    box-shadow: 0 14px 40px rgba(0,0,0,.45);
+  }
+  a.card:hover::before { opacity: 1; }
+
+  .card-top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .num {
+    font: 700 12px/1 ui-monospace, Consolas, monospace;
+    color: var(--accent, var(--blue));
+    background: color-mix(in srgb, var(--accent, var(--blue)) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent, var(--blue)) 32%, transparent);
+    padding: 5px 8px; border-radius: 6px;
+  }
+  .card h3 { font-size: 15.5px; font-weight: 600; }
+  .card p { font-size: 13px; color: var(--dim); margin-top: 2px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .tags span {
+    font: 500 11px/1 ui-monospace, Consolas, monospace;
+    color: #7f8c9d; background: rgba(255,255,255,.04);
+    border: 1px solid var(--line); padding: 5px 7px; border-radius: 5px;
+  }
+
+  footer {
+    margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 13px;
+  }
+  footer code {
+    font-family: ui-monospace, Consolas, monospace; color: var(--amber);
+    background: rgba(240,180,41,.08); padding: 2px 6px; border-radius: 4px;
+  }
+  .note {
+    margin-top: 14px; padding: 14px 16px; border-radius: 10px;
+    border: 1px solid rgba(126,231,135,.22); background: rgba(126,231,135,.06);
+    color: #a9d9b0; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">WEBGL · 33 LESSONS</div>
+    <h1>从一杯清屏开始，<em>画到迷你引擎</em></h1>
+    <p class="lede">
+      33 个独立的单文件示例，从「拿到一个 WebGL 上下文」一路走到「自己动手搭一个渲染引擎」。
+      每个文件都<b>不依赖任何库、不需要构建、不需要起服务器</b> —— 双击就能跑，代码里写满了注释。
+    </p>
+    <div class="meta">
+      <div class="chip">WebGL 1.0 / GLSL ES 1.00</div>
+      <div class="chip">零依赖 · 零构建</div>
+      <div class="chip">全部中文注释</div>
+      <div class="chip">逐课递进</div>
+    </div>
+  </header>
+
+  <h2>第一阶段 · 基础：从像素到矩阵</h2>
+  <div class="grid">
+    <a class="card" href="01-hello-webgl.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">01</span><h3>认识 WebGL：拿到上下文</h3></div>
+      <p>不画任何图形，先搞清画布尺寸、设备像素比和清屏这一帧的流程。</p>
+      <div class="tags"><span>getContext</span><span>viewport</span><span>DPR</span></div>
+    </a>
+
+    <a class="card" href="02-point.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">02</span><h3>第一个点：着色器与绘制流程</h3></div>
+      <p>编译着色器、链接程序、attribute / uniform 的区别，最小闭环跑通。</p>
+      <div class="tags"><span>vertex</span><span>fragment</span><span>uniform</span></div>
+    </a>
+
+    <a class="card" href="03-triangle.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">03</span><h3>一个三角形：顶点缓冲区</h3></div>
+      <p>GPU 只会光栅化三角形。第一次把几何数据放进显存并画出来。</p>
+      <div class="tags"><span>VBO</span><span>drawArrays</span><span>裁剪空间</span></div>
+    </a>
+
+    <a class="card" href="04-vertex-color.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">04</span><h3>顶点色插值：varying</h3></div>
+      <p>3 个顶点画出平滑渐变 —— 插值是 GPU 免费送给你的能力。</p>
+      <div class="tags"><span>varying</span><span>stride/offset</span><span>交错缓冲区</span></div>
+    </a>
+
+    <a class="card" href="05-animation.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">05</span><h3>让它动起来：uniform 与动画</h3></div>
+      <p>用真实时间而不是帧数驱动动画，顺便解决切标签页回来瞬移的坑。</p>
+      <div class="tags"><span>rAF</span><span>delta time</span><span>暂停</span></div>
+    </a>
+
+    <a class="card" href="06-matrix-2d.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">06</span><h3>矩阵变换：平移 / 旋转 / 缩放</h3></div>
+      <p>列主序、复合顺序、宽高比修正。手写旋转的终点，就是矩阵的起点。</p>
+      <div class="tags"><span>mat4</span><span>列主序</span><span>drawElements</span></div>
+    </a>
+  </div>
+
+  <h2>第二阶段 · 真正的 3D</h2>
+  <div class="grid">
+    <a class="card" href="07-cube-3d.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">07</span><h3>进入 3D：立方体与深度测试</h3></div>
+      <p>透视投影、视图矩阵、深度缓冲、背面剔除 —— 3D 的四个开关一次讲完。</p>
+      <div class="tags"><span>perspective</span><span>lookAt</span><span>DEPTH_TEST</span></div>
+    </a>
+
+    <a class="card" href="08-texture.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">08</span><h3>纹理贴图：UV 与 mipmap</h3></div>
+      <p>UV 怎么包上去、为什么要翻转 Y、NPOT 纹理有哪些限制。</p>
+      <div class="tags"><span>sampler2D</span><span>mipmap</span><span>UNPACK_FLIP_Y</span></div>
+    </a>
+
+    <a class="card" href="08b-local-image-texture.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">08B</span><h3>专题：本地图片当纹理</h3></div>
+      <p>拖拽/选图上传真实图片；跨域污染的坑与三条出路；NPOT 自动重采样。</p>
+      <div class="tags"><span>File API</span><span>CORS 污染</span><span>anisotropic</span></div>
+    </a>
+
+    <a class="card" href="08c-face-textures.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">08C</span><h3>专题：六面独立纹理</h3></div>
+      <p>选面贴图、6 次 draw call 与字节偏移绘制、多纹理对象管理、图集指路。</p>
+      <div class="tags"><span>多材质</span><span>draw call</span><span>atlas</span></div>
+    </a>
+
+    <a class="card" href="09-lighting.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">09</span><h3>光照：法线与 Blinn-Phong</h3></div>
+      <p>环境光 + 漫反射 + 高光 + 边缘光，还有那个必须用「逆转置」的法线矩阵。</p>
+      <div class="tags"><span>normal</span><span>Blinn-Phong</span><span>gamma</span></div>
+    </a>
+  </div>
+
+  <h2>第三阶段 · 工程与进阶</h2>
+  <div class="grid">
+    <a class="card" href="10-orbit-camera.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">10</span><h3>相机与交互：轨道控制</h3></div>
+      <p>球坐标描述相机、Pointer 事件拖拽缩放、距离雾给深度感。</p>
+      <div class="tags"><span>orbit</span><span>pointer events</span><span>fog</span></div>
+    </a>
+
+    <a class="card" href="11-instancing.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">11</span><h3>实例化：1 次 draw call 画 1600 个</h3></div>
+      <p>用 vertexAttribDivisor 让数据按实例步进，附带无扩展时的降级写法。</p>
+      <div class="tags"><span>instancing</span><span>divisor</span><span>GPU 动画</span></div>
+    </a>
+
+    <a class="card" href="12-postprocess.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">12</span><h3>离屏渲染：FBO 与后处理</h3></div>
+      <p>先画到纹理，再全屏处理一遍。色散、暗角、扫描线、噪点一次到位。</p>
+      <div class="tags"><span>framebuffer</span><span>renderbuffer</span><span>全屏四边形</span></div>
+    </a>
+
+    <a class="card" href="13-raymarching.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">13</span><h3>番外：光线步进（无几何）</h3></div>
+      <p>没有一个顶点，全靠 SDF + 片元着色器画出 3D 物体和软阴影。</p>
+      <div class="tags"><span>SDF</span><span>ray marching</span><span>软阴影</span></div>
+    </a>
+  </div>
+
+  <h2>第四阶段 · 进阶补全：真实感与交互</h2>
+  <div class="grid">
+    <a class="card" href="14-alpha-blending.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">14</span><h3>透明与混合：alpha blending</h3></div>
+      <p>blendFunc 数学、透明物体为什么关深度写入、画家算法排序、预乘 alpha。</p>
+      <div class="tags"><span>BLEND</span><span>depthMask</span><span>排序</span></div>
+    </a>
+
+    <a class="card" href="15-shadow-mapping.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">15</span><h3>阴影贴图：Shadow Mapping</h3></div>
+      <p>两次渲染、正交光源相机、深度打包进 RGBA、bias 与 PCF 软阴影。</p>
+      <div class="tags"><span>FBO</span><span>ortho</span><span>PCF</span></div>
+    </a>
+
+    <a class="card" href="16-normal-mapping.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">16</span><h3>法线贴图：切线空间与 TBN</h3></div>
+      <p>法线怎么存进 RGB、TBN 矩阵怎么建、程序化生成砖纹法线图。</p>
+      <div class="tags"><span>TBN</span><span>切线空间</span><span>凹凸</span></div>
+    </a>
+
+    <a class="card" href="17-cubemap-skybox.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">17</span><h3>立方体贴图：天空盒与反射</h3></div>
+      <p>6 面天空盒、textureCube 方向采样、reflect + 菲涅尔的环境反射球。</p>
+      <div class="tags"><span>cube map</span><span>skybox</span><span>fresnel</span></div>
+    </a>
+
+    <a class="card" href="18-particles.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">18</span><h3>粒子系统：点精灵与加色混合</h3></div>
+      <p>4000 粒子喷泉：gl_PointCoord 抠软圆、DYNAMIC_DRAW 部分上传、加色混合免排序。</p>
+      <div class="tags"><span>POINTS</span><span>gl_PointCoord</span><span>additive</span></div>
+    </a>
+
+    <a class="card" href="19-picking.html" style="--accent:#f0b429">
+      <div class="card-top"><span class="num">19</span><h3>拾取：射线求交与颜色编码</h3></div>
+      <p>鼠标反投影成射线解析求交；点击时渲染 ID 色 + readPixels 两种方案各写一遍。</p>
+      <div class="tags"><span>ray</span><span>readPixels</span><span>交互</span></div>
+    </a>
+  </div>
+
+  <h2>第五阶段 · 系统化：像引擎一样思考</h2>
+  <div class="grid">
+    <a class="card" href="20-scene-graph.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">20</span><h3>场景图：多对象与层级变换</h3></div>
+      <p>Node 树、world = parent × local、太阳-地球-月亮、按材质分组绘制。</p>
+      <div class="tags"><span>scene graph</span><span>层级</span><span>分组绘制</span></div>
+    </a>
+
+    <a class="card" href="21-terrain.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">21</span><h3>程序化地形：高度场与法线</h3></div>
+      <p>fBm 值噪声生成 128² 网格、差分法线、海拔/坡度调色、距离雾。</p>
+      <div class="tags"><span>fBm</span><span>heightfield</span><span>Uint16 上限</span></div>
+    </a>
+
+    <a class="card" href="22-skinning.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">22</span><h3>骨骼蒙皮：关节矩阵与权重</h3></div>
+      <p>uniform 矩阵数组、双关节权重插值、LBS 蒙皮与它的固有问题。</p>
+      <div class="tags"><span>skin</span><span>palette</span><span>weights</span></div>
+    </a>
+
+    <a class="card" href="23-text.html" style="--accent:#bc8cff">
+      <div class="card-top"><span class="num">23</span><h3>文字渲染：纹理图集与动态文本</h3></div>
+      <p>canvas 光栅化字符进图集、半像素内缩防渗色、FPS 计数器的动态重排。</p>
+      <div class="tags"><span>atlas</span><span>measureText</span><span>HUD</span></div>
+    </a>
+  </div>
+
+  <h2>第六阶段 · 高级：现代渲染管线</h2>
+  <div class="grid">
+    <a class="card" href="24-pbr.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">24</span><h3>PBR：Cook-Torrance 微表面</h3></div>
+      <p>D×F×G 三因子拆解、金属度/粗糙度、能量守恒与 HDR 色调映射。</p>
+      <div class="tags"><span>GGX</span><span>Fresnel</span><span>metallic-roughness</span></div>
+    </a>
+
+    <a class="card" href="25-webgl2.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">25</span><h3>WebGL2：VAO 与 GLSL ES 3.00</h3></div>
+      <p>in/out 语法迁移、VAO 打包状态、核心实例化，transform feedback 指路。</p>
+      <div class="tags"><span>#version 300 es</span><span>VAO</span><span>drawInstanced</span></div>
+    </a>
+
+    <a class="card" href="26-gpgpu.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">26</span><h3>GPGPU：渲染即计算</h3></div>
+      <p>状态存纹理、Ping-Pong 双缓冲，256² 片元并行演化生命游戏。</p>
+      <div class="tags"><span>ping-pong</span><span>状态纹理</span><span>并行</span></div>
+    </a>
+
+    <a class="card" href="27-engine.html" style="--accent:#7ee787">
+      <div class="card-top"><span class="num">27</span><h3>收官：迷你引擎架构</h3></div>
+      <p>Mesh / Material / Scene / Renderer 四层骨架，draw call 统计与状态排序。</p>
+      <div class="tags"><span>架构</span><span>draw call</span><span>three.js 序章</span></div>
+    </a>
+  </div>
+
+  <h2>第七阶段 · 综合演示：动态渲染</h2>
+  <div class="grid">
+    <a class="card" href="28-progressive-build.html" style="--accent:#58a6ff">
+      <div class="card-top"><span class="num">28</span><h3>动态构建：点 → 线 → 面</h3></div>
+      <p>同一份顶点数据分三幕长出来：顶点亮起、连线成网、三角形填满表面。</p>
+      <div class="tags"><span>POINTS</span><span>LINES</span><span>polygonOffset</span></div>
+    </a>
+
+    <a class="card" href="28b-mouse-paint.html" style="--accent:#ff9f43">
+      <div class="card-top"><span class="num">28B</span><h3>鼠标绘制：gl.POINTS 造一支画笔</h3></div>
+      <p>按住鼠标画画：盖章笔刷、速度感应笔宽、撤销重画，全部笔迹存在数组里。</p>
+      <div class="tags"><span>pointer 事件</span><span>点精灵</span><span>增量上传</span></div>
+    </a>
+
+    <a class="card" href="28c-vector-paint.html" style="--accent:#ff9f43">
+      <div class="card-top"><span class="num">28C</span><h3>矢量绘制：点 → 线 → 面</h3></div>
+      <p>锚点长成粗线段（四边形膨胀）和填充多边形（三角扇）；渐变沿路径/对角线展开。</p>
+      <div class="tags"><span>四边形展开</span><span>三角扇</span><span>逐顶点渐变</span></div>
+    </a>
+
+    <a class="card" href="28d-texture-paint.html" style="--accent:#ff9f43">
+      <div class="card-top"><span class="num">28D</span><h3>纹理画板：多边形贴上图片</h3></div>
+      <p>画个多边形用真实图片填满：包围盒 UV 映射、跨域污染三级加载、拖拽选图。</p>
+      <div class="tags"><span>sampler2D</span><span>包围盒 UV</span><span>blob 兜底</span></div>
+    </a>
+  </div>
+
+  <footer>
+    <div class="note">
+      <b>怎么跑：</b>直接双击任意 HTML 文件即可（Chrome / Edge / Firefox 都行）。
+      全部示例刻意不加载外部图片和 CDN，就是为了让 <code>file://</code> 协议下也能正常工作。
+    </div>
+    <p style="margin-top:18px">
+      建议按编号顺序看：每一课只引入 1~2 个新概念，前面的代码会原样出现在后面。
+      遇到黑屏先看浏览器控制台 —— 着色器编译失败会抛出带 infoLog 的错误。
+    </p>
+  </footer>
+</div>
+</body>
+</html>

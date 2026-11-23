@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>15 · 阴影贴图：Shadow Mapping</title>
+<!--
+  ============================================================
+  第 15 课：阴影贴图（Shadow Mapping）
+  ------------------------------------------------------------
+  阴影的本质是一句话：
+    「从光源看过去，被挡住的区域就是阴影。」
+  怎么知道被挡住？把「光源视角下的深度图」先存下来，
+  再在正式渲染时问一句：这个像素在光源眼里是不是被别的东西挡住了？
+
+  本课新知识点：
+    1. 两次渲染：Pass1 从光源视角把深度画进 FBO；Pass2 正常渲染并采样
+    2. 正交投影（ortho）—— 平行光用正交相机，不用透视
+    3. 深度打包：WebGL1 没有深度纹理扩展时，把 0~1 深度拆进 RGBA 四个通道
+    4. Shadow acne（阴影粉刺）与 bias（斜率缩放）
+    5. PCF（Percentage Closer Filtering）：3x3 采样把阴影边缘揉软
+
+  真实引擎一般用 WEBGL_depth_texture 扩展直接得到深度纹理（WebGL2 原生支持），
+  本课为了零依赖，手写 pack/unpack —— 这也是很多老游戏的实现方式，值得掌握。
+
+  按空格切换「查看光源视角的深度图」。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 15</div>
+  <h1>阴影贴图：Shadow Mapping</h1>
+  <p>Pass1 从光源视角渲染深度图 → Pass2 渲染时比对深度，被挡住的地方就是阴影。</p>
+  <div class="tip">按空格查看光源视角的深度图 · 注意箱子和地面上的软阴影</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（新增 ortho —— 平行光/阴影贴图的标配）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+
+  /* 正交投影：把盒子 [-l,r]x[-b,t]x[-n,f] 压成 [-1,1]^3 的立方体。
+   * 平行光没有「近大远小」，所以光源相机用正交而不是透视。 */
+  ortho(l, r, b, t, n, f) {
+    const lr = 1 / (l - r), bt = 1 / (b - t), nf = 1 / (n - f);
+    return new Float32Array([
+      -2*lr, 0, 0, 0,
+      0, -2*bt, 0, 0,
+      0, 0, 2*nf, 0,
+      (l+r)*lr, (b+t)*bt, (f+n)*nf, 1
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+
+  /* 本课的模型都是旋转+等比缩放，mat3(model) 归一化后就是正确法线矩阵。
+   * 非等比缩放的通用版（逆转置）见第 9 课 normalMatrixFromMat4。 */
+  normalMat3Of(m) {
+    return new Float32Array([m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * Pass 1 程序：从光源视角，把深度「打包」写进 RGBA 颜色纹理
+ * ----------------------------------------------------------------
+ * 一个 float 有 32 位精度，RGBA 每通道 8 位 —— 把它当成 256 进制的
+ * 4 位数来存：R 是最高位，A 是最低位。经典 pack/unpack 技巧。
+ * ================================================================== */
+const depthProgram = createProgram(`
+  attribute vec3 aPos;
+  uniform mat4 uMvp;
+  void main() { gl_Position = uMvp * vec4(aPos, 1.0); }
+`, `
+  precision highp float;
+
+  vec4 pack(float d) {
+    vec4 enc = vec4(1.0, 255.0, 65025.0, 16581375.0) * d;
+    enc = fract(enc);
+    enc -= enc.yzww * vec4(1.0/255.0, 1.0/255.0, 1.0/255.0, 0.0);
+    return enc;
+  }
+  void main() {
+    gl_FragColor = pack(gl_FragCoord.z);
+  }
+`);
+
+/* ==================================================================
+ * Pass 2 程序：正常渲染 + 采样阴影
+ * ================================================================== */
+const mainProgram = createProgram(`
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform mat4 uShadowMvp;     // 光源空间：ortho * view(light) * model
+  uniform mat3 uNormalMat;
+
+  varying vec3 vNormal;
+  varying vec3 vWorldPos;
+  varying vec4 vShadowPos;     // 顶点在「光源视角」下的坐标，交给片元做比对
+
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos = world.xyz;
+    vNormal = normalize(uNormalMat * aNormal);
+    vShadowPos = uShadowMvp * vec4(aPos, 1.0);   // 注意用原始 aPos，别乘两遍
+    gl_Position = uProj * uView * world;
+  }
+`, `
+  precision highp float;
+
+  varying vec3 vNormal;
+  varying vec4 vShadowPos;
+
+  uniform vec3  uLightDir;     // 表面 -> 光源 方向（世界空间）
+  uniform vec3  uColor;
+  uniform sampler2D uShadowMap;
+  uniform vec2  uShadowTexel;  // 1/阴影图宽高，PCF 用
+  uniform float uShowShadowMap;
+
+  float unpack(vec4 rgba) {
+    return dot(rgba, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0));
+  }
+
+  void main() {
+    // 透视除法 -> NDC -> [0,1] 纹理空间（x,y 是 UV，z 是 0~1 深度）
+    vec3 sc = vShadowPos.xyz / vShadowPos.w;
+    sc = sc * 0.5 + 0.5;
+
+    // 调试模式：直接显示光源视角深度图（离光源越近越暗）
+    if (uShowShadowMap > 0.5) {
+      float d = unpack(texture2D(uShadowMap, clamp(sc.xy, 0.0, 1.0)));
+      gl_FragColor = vec4(vec3(d), 1.0);
+      return;
+    }
+
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uLightDir);
+    float NdotL = max(dot(N, L), 0.0);
+
+    /* 斜率缩放 bias：解决 shadow acne（阴影粉刺）。
+     * 深度图分辨率有限 + 光源深度和接收面深度数值上几乎相等，
+     * 表面越「侧对」光源，一个纹素覆盖的深度跨度越大，
+     * 越容易把自己误判成阴影 —— 表现为满身条纹。
+     * NdotL 越小（越侧对）bias 越大，就是这个道理。 */
+    float bias = max(0.05 * (1.0 - NdotL), 0.005);
+
+    /* PCF 3x3：对每个像素问 9 个邻居「你被挡住吗」，取平均，
+     * 得到 0~1 的柔和阴影边缘。代价是 9 倍采样，
+     * 更高级的方案有 PCSS、VSM、ESM、CSM（级联）。 */
+    float shadow = 0.0;
+    for (int y = -1; y <= 1; y++) {
+      for (int x = -1; x <= 1; x++) {
+        vec2 uv = sc.xy + vec2(x, y) * uShadowTexel;
+        float stored = unpack(texture2D(uShadowMap, clamp(uv, 0.0, 1.0)));
+        shadow += (stored + bias < sc.z) ? 0.0 : 1.0;
+      }
+    }
+    shadow /= 9.0;
+
+    // 背光面没有直射光，只留环境光；受光面亮度乘以阴影因子
+    float lambert = 0.14 + 0.86 * NdotL * shadow;
+
+    vec3 color = uColor * lambert;
+    color = pow(color, vec3(1.0/2.2));
+    gl_FragColor = vec4(color, 1.0);
+  }
+`);
+
+/* ==================================================================
+ * 几何：单位立方体（含法线）+ 地面
+ * ================================================================== */
+const cubePos = new Float32Array([
+  -1,-1, 1,   1,-1, 1,   1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,   1,-1,-1,   1, 1,-1,  -1, 1,-1
+]);
+const cubeNorm = new Float32Array([
+   0, 0, 1,   0, 0, 1,   0, 0, 1,   0, 0, 1,
+   0, 0,-1,   0, 0,-1,   0, 0,-1,   0, 0,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,   1,5,6, 1,6,2,
+  4,0,3, 4,3,7,   3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+const planePos  = new Float32Array([-1,0,-1, 1,0,-1, 1,0,1, -1,0,1]);
+const planeNorm = new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]);
+const planeIdx  = new Uint16Array([0,2,1, 0,3,2]);   // 绕序保证从 +Y 看是逆时针（正面）
+
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+const cbPos = buf(gl.ARRAY_BUFFER, cubePos);
+const cbNor = buf(gl.ARRAY_BUFFER, cubeNorm);
+const cbIdx = buf(gl.ELEMENT_ARRAY_BUFFER, cubeIdx);
+const pbPos = buf(gl.ARRAY_BUFFER, planePos);
+const pbNor = buf(gl.ARRAY_BUFFER, planeNorm);
+const pbIdx = buf(gl.ELEMENT_ARRAY_BUFFER, planeIdx);
+
+/* ==================================================================
+ * 阴影图 FBO：1024x1024，颜色纹理存打包深度
+ * ================================================================== */
+const SHADOW_SIZE = 1024;
+const shadowFbo = gl.createFramebuffer();
+const shadowTex = gl.createTexture();
+
+gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SHADOW_SIZE, SHADOW_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);  // 打包深度不能用 LINEAR！
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+// 线性插值会把「打包好的 4 个字节」搅混 —— 这正是深度纹理要硬件支持的原因
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadowTex, 0);
+
+// 阴影 pass 也需要深度附件：否则 caster 之间的互相遮挡关系不对
+const shadowDepthRb = gl.createRenderbuffer();
+gl.bindRenderbuffer(gl.RENDERBUFFER, shadowDepthRb);
+gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, SHADOW_SIZE, SHADOW_SIZE);
+gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, shadowDepthRb);
+
+if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+  throw new Error('shadow FBO incomplete');
+}
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+/* ==================================================================
+ * 场景：地面 + 3 个箱子
+ * ================================================================== */
+const boxes = [
+  { pos: [-1.6, 0.75, -0.4], size: [1.5, 1.5, 1.5], color: [0.85, 0.45, 0.30], spin: 0.0 },
+  { pos: [ 1.7, 0.55,  1.2], size: [1.1, 1.1, 1.1], color: [0.35, 0.75, 0.60], spin: 0.35 },
+  { pos: [ 0.3, 0.95, -2.0], size: [1.9, 1.9, 0.7], color: [0.45, 0.55, 0.90], spin: 0.9 }
+];
+
+// 平行光只有「方向」；位置只是构造光源 view 矩阵用的虚构眼睛
+const LIGHT_DIR_TO = [-0.55, -1.0, -0.4];   // 光射向的方向
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+let showShadowMap = false;
+window.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  showShadowMap = !showShadowMap;
+});
+
+const U = n => gl.getUniformLocation(mainProgram, n);
+const uLoc = {
+  model: U('uModel'), view: U('uView'), proj: U('uProj'),
+  shadowMvp: U('uShadowMvp'), normalMat: U('uNormalMat'),
+  lightDir: U('uLightDir'), color: U('uColor'),
+  shadowMap: U('uShadowMap'), shadowTexel: U('uShadowTexel'),
+  showShadowMap: U('uShowShadowMap')
+};
+const dMvpLoc = gl.getUniformLocation(depthProgram, 'uMvp');
+const dPosLoc = gl.getAttribLocation(depthProgram, 'aPos');
+const mPosLoc = gl.getAttribLocation(mainProgram, 'aPos');
+const mNorLoc = gl.getAttribLocation(mainProgram, 'aNormal');
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+
+  // 光源虚拟相机：沿光方向的反方向退 14 个单位看向原点
+  const lightEye = [-LIGHT_DIR_TO[0] * 14, -LIGHT_DIR_TO[1] * 14, -LIGHT_DIR_TO[2] * 14];
+  const lightView = M4.lookAt(lightEye, [0, 0, 0], [0, 1, 0]);
+  // 正交盒要比场景大一圈：太小会裁掉阴影，太大会浪费深度精度
+  const lightProj = M4.ortho(-9, 9, -9, 9, 1, 30);
+
+  const modelMats = boxes.map(b => M4.chain(
+    M4.translate(b.pos[0], b.pos[1], b.pos[2]),
+    M4.rotateY(t * b.spin),
+    M4.scale(b.size[0] / 2, b.size[1] / 2, b.size[2] / 2)
+  ));
+  const groundModel = M4.scale(9, 1, 9);
+
+  /* ================ Pass 1：光源视角渲染深度图 ================ */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+  gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+  gl.clearColor(1, 1, 1, 1);        // 清成 1.0 = 最远处；没画到的区域视为「无遮挡」
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(depthProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cbPos);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cbIdx);
+  gl.vertexAttribPointer(dPosLoc, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(dPosLoc);
+  for (const m of modelMats) {      // 只画 caster（能投影的东西，地面不用）
+    gl.uniformMatrix4fv(dMvpLoc, false, M4.chain(lightProj, lightView, m));
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+  }
+
+  /* ================ Pass 2：正常渲染 + 采样阴影 ================ */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.04, 0.05, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(mainProgram);
+  gl.uniformMatrix4fv(uLoc.view, false, M4.lookAt([4.2, 3.6, 6.0], [0, 0.6, 0], [0, 1, 0]));
+  gl.uniformMatrix4fv(uLoc.proj, false, M4.perspective(50 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100));
+  gl.uniform3f(uLoc.lightDir, -LIGHT_DIR_TO[0], -LIGHT_DIR_TO[1], -LIGHT_DIR_TO[2]);
+  gl.uniform1i(uLoc.shadowMap, 0);
+  gl.uniform2f(uLoc.shadowTexel, 1 / SHADOW_SIZE, 1 / SHADOW_SIZE);
+  gl.uniform1f(uLoc.showShadowMap, showShadowMap ? 1 : 0);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+
+  gl.enableVertexAttribArray(mPosLoc);
+  gl.enableVertexAttribArray(mNorLoc);
+
+  // 地面：receiver（接受阴影）
+  gl.bindBuffer(gl.ARRAY_BUFFER, pbPos);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, pbIdx);
+  gl.vertexAttribPointer(mPosLoc, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, pbNor);
+  gl.vertexAttribPointer(mNorLoc, 3, gl.FLOAT, false, 0, 0);
+  gl.uniform3f(uLoc.color, 0.42, 0.46, 0.52);
+  gl.uniformMatrix4fv(uLoc.model, false, groundModel);
+  gl.uniformMatrix3fv(uLoc.normalMat, false, M4.normalMat3Of(groundModel));
+  gl.uniformMatrix4fv(uLoc.shadowMvp, false, M4.chain(lightProj, lightView, groundModel));
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+  // 箱子：既是 caster 也是 receiver（能看到侧面被别的箱子遮挡的暗部）
+  gl.bindBuffer(gl.ARRAY_BUFFER, cbPos);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cbIdx);
+  gl.vertexAttribPointer(mPosLoc, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cbNor);
+  gl.vertexAttribPointer(mNorLoc, 3, gl.FLOAT, false, 0, 0);
+  boxes.forEach((b, i) => {
+    gl.uniform3fv(uLoc.color, b.color);
+    gl.uniformMatrix4fv(uLoc.model, false, modelMats[i]);
+    gl.uniformMatrix3fv(uLoc.normalMat, false, M4.normalMat3Of(modelMats[i]));
+    gl.uniformMatrix4fv(uLoc.shadowMvp, false, M4.chain(lightProj, lightView, modelMats[i]));
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+  });
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 阴影贴图的进阶话题（知道名字，遇到时知道去查什么）：
+ *   Peter-panning —— bias 太大导致阴影「脱体漂浮」，缩小 bias 或收紧正交盒
+ *   CSM 级联阴影 —— 大场景近处用高精度、远处用低精度的多级阴影图
+ *   PCSS —— 根据遮挡距离动态调整 PCF 半径，得到「越远越软」的接触硬化阴影
+ *   VSM/ESM —— 把深度分布存成矩，可做真正的模糊，换 PCF
+ *   点光源阴影 —— 用 cube map 的 6 个面存深度（第 17 课讲 cube map）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · 进入 3D：立方体、透视投影与深度测试</title>
+<!--
+  ============================================================
+  第 7 课：真正的 3D
+  ------------------------------------------------------------
+  从 2D 到 3D 只多了三件东西：
+    1. 投影矩阵 —— 把「相机看到的三维视锥体」压成 [-1,1] 的立方体
+    2. 视图矩阵 —— 把世界挪到相机原点，相机永远朝 -Z 看
+    3. 深度测试 —— 让近的像素盖住远的像素，否则遮挡关系全靠运气
+
+  本课新知识点：
+    M4.perspective / M4.lookAt / 深度缓冲 / 背面剔除 / 索引复用
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 07</div>
+  <h1>进入 3D：立方体、透视与深度</h1>
+  <p>8 个顶点 + 36 个索引画出 12 个三角形。透视让远处的边变短，深度测试保证遮挡正确。</p>
+  <div class="tip">试试注释掉 gl.enable(gl.DEPTH_TEST)，看立方体的面是如何互相穿透的。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（列主序，同第 6 课，新增透视和视图矩阵）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+
+  /* ----------------------------------------------------------------
+   * 透视投影：把视锥体（一个梯形金字塔）映射成 [-1,1]³ 的立方体
+   *   fovy   : 垂直方向的张角（弧度），越大越广角、透视越夸张
+   *   aspect : 画布宽高比（必须跟着 resize 更新，否则画面被拉伸）
+   *   near/far: 近远裁剪面距离，太小会有深度精度问题
+   *
+   * 关键在第四行：结果的 w 分量 = -z（相机空间），
+   * 后面 GPU 会做透视除法 (x/w, y/w, z/w) —— 越远 z 绝对值越大，w 越大，
+   * 屏幕坐标就被压缩得越厉害。这就是「近大远小」的数学来源。
+   * ---------------------------------------------------------------- */
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2);
+    const nf = 1 / (near - far);
+    return new Float32Array([
+      f / aspect, 0, 0, 0,
+      0, f, 0, 0,
+      0, 0, (far + near) * nf, -1,
+      0, 0, 2 * far * near * nf, 0
+    ]);
+  },
+
+  /* ----------------------------------------------------------------
+   * 视图矩阵：把「相机在 world 原点、朝 -Z 看」这个约定，
+   * 换算成「任意位置任意朝向的相机」。等价于对世界做 inverse(cameraTransform)。
+   *   eye    : 相机位置
+   *   center : 注视点
+   *   up     : 上方向（不能和视线平行，否则叉乘退化成零向量）
+   * ---------------------------------------------------------------- */
+  lookAt(eye, center, up) {
+    const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+
+    const z = norm(sub(eye, center));      // 相机 +Z 指向自己背后
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+
+    return new Float32Array([
+      x[0], y[0], z[0], 0,
+      x[1], y[1], z[1], 0,
+      x[2], y[2], z[2], 0,
+      -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+    ]);
+  }
+};
+
+/* ------------------------------------------------------------------
+ * 着色器
+ * uMvp 是「投影 · 视图 · 模型」三者相乘的结果。
+ * 严格说应该分开传三个矩阵：法线变换、世界坐标光照都需要单独的模型矩阵，
+ * 第 9 课就会拆开。这里先合成一个，减少变量。
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec3 aPos;
+
+  uniform mat4 uMvp;
+  varying vec3 vColor;      // 用位置当颜色，方便观察立方体的朝向变化
+
+  void main() {
+    gl_Position = uMvp * vec4(aPos, 1.0);
+    vColor = aPos * 0.5 + 0.5;    // [-1,1] -> [0,1]
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec3 vColor;
+  void main() { gl_FragColor = vec4(vColor, 1.0); }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 几何：立方体
+ * ----------------------------------------------------------------
+ * 8 个角点足够描述位置，用索引拼出 6 个面。
+ * 每个面的顶点顺序必须「从外面看是逆时针」，配合 CULL_FACE 才正确。
+ *
+ * 注意：等到第 9 课做法线光照时，8 个顶点就不够了 ——
+ * 立方体相邻面共享角点但法线不同，必须拆成 24 个顶点。
+ * 索引复用的前提是「所有 attribute 都相同」。
+ * ================================================================== */
+const cubeVertices = new Float32Array([
+  // 前面 z = +1   0..3
+  -1, -1,  1,
+   1, -1,  1,
+   1,  1,  1,
+  -1,  1,  1,
+  // 后面 z = -1   4..7
+  -1, -1, -1,
+   1, -1, -1,
+   1,  1, -1,
+  -1,  1, -1
+]);
+
+const cubeIndices = new Uint16Array([
+  // 正面 +Z
+  0, 1, 2,  0, 2, 3,
+  // 背面 -Z
+  5, 4, 7,  5, 7, 6,
+  // 右面 +X
+  1, 5, 6,  1, 6, 2,
+  // 左面 -X
+  4, 0, 3,  4, 3, 7,
+  // 顶面 +Y
+  3, 2, 6,  3, 6, 7,
+  // 底面 -Y
+  4, 5, 1,  4, 1, 0
+]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, cubeVertices, gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeIndices, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+
+const uMvpLoc = gl.getUniformLocation(program, 'uMvp');
+
+/* ------------------------------------------------------------------
+ * 3D 必备的两个开关
+ * ------------------------------------------------------------------ */
+// 深度测试：片元写入前比较深度值，比已有值远就丢弃。
+// 没有它，面与面的覆盖顺序 = 绘制顺序，立方体会变成一堆乱插的三角形。
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);   // 默认 LESS；用 LEQUAL 更宽容，等深度的后画者获胜
+
+// 背面剔除：省掉一半不到的片元。绕序错了会看到「透明」的物体，
+// 排查方法：临时 gl.disable(gl.CULL_FACE) 看是否恢复。
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.frontFace(gl.CCW);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  // 一定要清深度！否则上一帧的深度值会挡住这一帧的绘制
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+
+  const proj = M4.perspective(60 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt([0, 1.6, 5.5], [0, 0, 0], [0, 1, 0]);
+  const model = M4.chain(
+    M4.rotateY(t * 0.7),
+    M4.rotateX(t * 0.45),
+    M4.scale(1.0, 1.0, 1.0)
+  );
+
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+  gl.drawElements(gl.TRIANGLES, cubeIndices.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

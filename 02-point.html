@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>02 · 第一个点：着色器与绘制流程</title>
+<!--
+  ============================================================
+  第 2 课：跑通「一个点」
+  ------------------------------------------------------------
+  目标：理解 WebGL 的最小闭环
+        数据 -> 顶点着色器 -> 光栅化 -> 片元着色器 -> 帧缓冲
+
+  这一步只要成功了，后面的三角形、立方体、球，
+  在流程上完全是同一件事，区别只在「数据有多少、着色器怎么算」。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 02</div>
+  <h1>第一个点：着色器与绘制流程</h1>
+  <p>只有一个顶点，没有缓冲区。位置、大小、颜色全部由 uniform 驱动。</p>
+  <div class="tip">注意：点的大小在真实设备上有上限，Windows 的 D3D 后端常常只支持到 64px。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 一、着色器：跑在 GPU 上的两段小程序
+ * ----------------------------------------------------------------
+ * 顶点着色器（Vertex Shader）
+ *   - 每个顶点执行一次（这里只有 1 个顶点）
+ *   - 必须给内置变量 gl_Position 赋值：裁剪空间坐标 vec4(x, y, z, w)
+ *   - 裁剪空间：x/y/z 都在 [-w, w] 之间才可见。w 通常填 1.0，
+ *     此时 x∈[-1,1]、y∈[-1,1] 正好铺满整个画布（原点在画布正中）
+ *
+ * 片元着色器（Fragment Shader）
+ *   - 每个「将要被涂色的像素」执行一次（光栅化产生多少个片元就执行多少次）
+ *   - 必须给内置变量 gl_FragColor 赋值
+ *   - 精度限定符 precision mediump float 是 ES 2.0 的硬性要求，
+ *     不写会编译报错（这是新手最常见的第一个错误）
+ * ================================================================== */
+
+const VERT_SRC = `
+  attribute vec2 aPos;        // attribute = 每个顶点各自不同的数据（来自缓冲区）
+  uniform   vec2 uOffset;     // uniform  = 整次绘制中所有顶点共享的常量（来自 JS）
+  uniform   float uSize;
+
+  void main() {
+    // aPos 是模型自带的坐标，uOffset 是这一帧的位移，两者在顶点着色器里合成
+    gl_Position  = vec4(aPos + uOffset, 0.0, 1.0);  // z=0, w=1 -> 直接用裁剪空间坐标
+    gl_PointSize = uSize;                           // 只在 gl.POINTS 模式下有意义，单位是像素
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;    // 浮点精度：lowp / mediump / highp（移动端 highp 可能不支持）
+  uniform vec3 uColor;
+
+  void main() {
+    // 想要圆点可以配合 gl_PointCoord（当前片元在点内的 0~1 坐标）来裁剪形状，
+    // 例如: if (length(gl_PointCoord - 0.5) > 0.5) discard;
+    gl_FragColor = vec4(uColor, 1.0);
+  }
+`;
+
+/* ==================================================================
+ * 二、编译 + 链接
+ *    WebGL 的着色器是字符串，必须手动编译、手动链接成 program。
+ *    任何一步失败都要把 infoLog 打出来 —— 否则你只会看到一片黑屏。
+ * ================================================================== */
+function compileShader(type, src) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, src);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return shader;
+}
+
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);                       // 链接：把两段程序拼成一条管线
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error('程序链接失败:\n' + gl.getProgramInfoLog(program));
+  }
+  // 链接完成后 shader 对象就可以释放了，program 已经持有编译结果
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  return program;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);   // 把它设为当前使用的管线（后面 draw 都用它）
+
+/* ==================================================================
+ * 三、准备顶点数据
+ *    三角形哪怕只有 3 个点，也必须走「缓冲区」这条路；
+ *    但 1 个点可以偷懒：直接把坐标硬编码进着色器，或者用一个极小的缓冲。
+ *    这里仍然用缓冲区，因为这是后面所有例子的标准写法。
+ *
+ *    Float32Array 不是随便选的：GPU 的浮点缓冲区是 IEEE-754 单精度，
+ *    用普通 JS 数组会先被隐式转换，显式使用 Float32Array 更省一次拷贝。
+ * ================================================================== */
+const positionBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);          // 绑定到 ARRAY_BUFFER 这个「槽位」
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0]), gl.STATIC_DRAW);
+// STATIC_DRAW = 数据只写一次、多次使用；动态更新的数据用 DYNAMIC_DRAW
+
+// 拿到 attribute 在 program 里的位置索引（-1 表示被优化掉了/名字写错）
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+
+// 告诉 GPU：aPos 这个 attribute 从哪读、怎么读、每次跨多少字节
+// 参数：位置, 分量个数(2), 类型, 是否归一化, 步长(0=紧密排列), 偏移
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+// uniform 的位置可以先查出来缓存住（每帧都调 getUniformLocation 是常见性能坑）
+const uOffsetLoc = gl.getUniformLocation(program, 'uOffset');
+const uSizeLoc   = gl.getUniformLocation(program, 'uSize');
+const uColorLoc  = gl.getUniformLocation(program, 'uColor');
+
+/* ==================================================================
+ * 四、绘制
+ *    drawArrays(模式, 起始顶点, 顶点数量)
+ *      gl.POINTS   每个顶点一个点
+ *      gl.LINES    每 2 个顶点一条线
+ *      gl.TRIANGLES 每 3 个顶点一个三角形（最常用）
+ * ================================================================== */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+const startTime = performance.now();
+
+function render(now) {
+  const t = (now - startTime) / 1000;
+  resize();
+
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // 让点沿一个椭圆缓慢移动
+  const rx = Math.cos(t * 0.8) * 0.6;
+  const ry = Math.sin(t * 1.1) * 0.45;
+
+  // uniform 每帧只改常量，不需要重新上传顶点数据。
+  // 但如果要画 1000 个位置各不相同的点，逐个改 uniform 就等于 1000 次 draw call，
+  // 那是 CPU 侧的开销大头 —— 后面第 11 课用「实例化」把它压成 1 次。
+  gl.uniform2f(uOffsetLoc, rx, ry);
+
+  gl.uniform1f(uSizeLoc, 26 + 18 * (0.5 + 0.5 * Math.sin(t * 3.0)));   // 呼吸式大小
+  gl.uniform3f(uColorLoc,
+    0.45 + 0.45 * Math.sin(t * 1.3),
+    0.55 + 0.35 * Math.sin(t * 1.7 + 1.0),
+    0.65 + 0.30 * Math.sin(t * 2.1 + 2.0));
+
+  gl.drawArrays(gl.POINTS, 0, 1);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 自查清单（以后遇到黑屏就按顺序排查）：
+ *   1. gl.getError() 是否 INVALID_*？
+ *   2. 着色器编译 / 程序链接的 infoLog 有没有报错？
+ *   3. attribute 位置是不是 -1（名字拼错，或被编译器优化掉）？
+ *   4. 顶点坐标是不是落在 [-1,1] 之外？
+ *   5. 有没有调用 gl.viewport？viewport 尺寸是不是 0？
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

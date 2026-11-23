@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>17 · 立方体贴图：天空盒与环境反射</title>
+<!--
+  ============================================================
+  第 17 课：立方体贴图（Cube Map）
+  ------------------------------------------------------------
+  2D 纹理用一个 UV 采样；立方体贴图用「一个 3D 方向向量」采样 ——
+  GPU 自动选出向量指向的那个面。它天然适合两件事：
+    1. 天空盒：把 6 张图贴在无穷远的盒子上，组成环境背景
+    2. 环境反射：反射向量采样 cubemap，金属/玻璃就有了「内容」可反
+
+  本课新知识点：
+    1. gl.TEXTURE_CUBE_MAP 与 6 个面的绑定（+X -X +Y -Y +Z -Z）
+    2. textureCube(dir) 的采样方式（不是 UV，是方向！）
+    3. 天空盒的标准画法：大盒子 + 去掉平移的视图矩阵 + LEQUAL 深度
+    4. 反射向量 reflect(V, N) 与菲涅尔效应（Fresnel）
+    5. WebGL1 的 cubemap 面必须是「正方形 + POT」
+
+  6 个面全部由代码程序化生成（渐变天空 + 太阳 + 海面），零外部资源。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 17</div>
+  <h1>立方体贴图：天空盒与环境反射</h1>
+  <p>6 张程序化天空图组成天空盒；中央金属球用反射向量采样它，菲涅尔项让掠射角反射更强。</p>
+  <div class="tip">相机自动环绕 —— 注意天空与球面反射内容一致</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 精简矩阵库
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  },
+  /* 去掉平移的视图矩阵：天空盒应该「无限远」，
+   * 相机怎么平移它都不该动 —— 只保留旋转部分即可。 */
+  viewRotOnly(view) {
+    return new Float32Array([
+      view[0], view[1], view[2], 0,
+      view[4], view[5], view[6], 0,
+      view[8], view[9], view[10], 0,
+      0, 0, 0, 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 程序 A：天空盒
+ * ----------------------------------------------------------------
+ * 顶点直接输出盒子的局部坐标作为「方向」：
+ *   gl_Position = proj * viewRot * pos
+ *   dir = pos（w=1，采样时用 xyz）
+ * 片元里用 dir 采样 textureCube。
+ * ================================================================== */
+const skyProgram = createProgram(`
+  attribute vec3 aPos;
+  uniform mat4 uViewRot;
+  uniform mat4 uProj;
+  varying vec3 vDir;
+  void main() {
+    vDir = aPos;
+    // 放大 100 倍：相机必须位于盒子内部，才能看到「四面八方都是天空」
+    // 让 z = w（即深度恒为 1，最远），配合 LEQUAL 让场景画在它前面
+    gl_Position = (uProj * uViewRot * vec4(aPos * 100.0, 1.0)).xyww;
+  }
+`, `
+  precision mediump float;
+  varying vec3 vDir;
+  uniform samplerCube uCube;
+  void main() {
+    gl_FragColor = textureCube(uCube, normalize(vDir));
+  }
+`);
+
+/* ==================================================================
+ * 程序 B：反射球（无外部光照，纯环境反射 + 菲涅尔）
+ * ================================================================== */
+const ballProgram = createProgram(`
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform mat3 uNormalMat;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos = world.xyz;
+    vNormal = normalize(uNormalMat * aNormal);
+    gl_Position = uProj * uView * world;
+  }
+`, `
+  precision highp float;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+  uniform samplerCube uCube;
+  uniform vec3 uEye;
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(vWorldPos - uEye);     // 表面 -> 相机
+
+    /* 反射向量：入射 V 关于法线 N 的镜像。
+     * textureCube 的方向约定：方向从「中心指向要采样的点」，
+     * 所以反射方向 = reflect(V, N) 直接可采样。 */
+    vec3 R = reflect(V, N);
+
+    /* 菲涅尔（Schlick 近似）：正对物体时反射弱（透出海面色），
+     * 掠射角反射强（边缘像镜子）。这是所有「看起来像金属/水」的关键。 */
+    float fres = 0.06 + 0.94 * pow(1.0 - max(dot(-V, N), 0.0), 5.0);
+
+    vec3 refl = textureCube(uCube, R).rgb;
+    vec3 base = vec3(0.10, 0.16, 0.22);       // 深海色的「玻璃底色」
+    vec3 color = mix(base, refl, fres);
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`);
+
+/* ==================================================================
+ * 程序化生成 6 张天空面
+ * ----------------------------------------------------------------
+ * 面顺序（WebGL 规定）：
+ *   0:+X  1:-X  2:+Y  3:-Y  4:+Z  5:-Z
+ * 注意：cubemap 各面的「朝向约定」很反直觉（+X 面的 V 轴是反的），
+ * 手工贴图最容易出错的地方 —— 这也是为什么实际项目都直接用
+ * equirect -> cubemap 的转换工具。
+ * 这里每张面画「上蓝下暗的渐变 + 太阳」，肉眼对齐即可。
+ * ================================================================== */
+function drawSkyFace(face, size) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size;
+  const ctx = cv.getContext('2d');
+
+  if (face === 2) {
+    // +Y 天顶：纯天蓝
+    ctx.fillStyle = '#3d7bd6'; ctx.fillRect(0, 0, size, size);
+  } else if (face === 3) {
+    // -Y 海底：深蓝渐变
+    const g = ctx.createLinearGradient(0, 0, 0, size);
+    g.addColorStop(0, '#0a2a4a'); g.addColorStop(1, '#051525');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
+  } else {
+    // 四个侧面：上天天蓝 -> 地平线亮 -> 海面深蓝
+    const g = ctx.createLinearGradient(0, 0, 0, size);
+    g.addColorStop(0.00, '#3d7bd6');
+    g.addColorStop(0.42, '#a8cbe8');
+    g.addColorStop(0.50, '#e8d9a8');   // 地平线的暖光
+    g.addColorStop(0.52, '#1a4a70');
+    g.addColorStop(1.00, '#0a2a4a');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
+
+    // 海面高光条纹（只画下半部分）
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#cfe4f5';
+    for (let y = 0.55; y < 1; y += 0.06) {
+      ctx.fillRect(0, size * y, size, size * 0.012);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 太阳：+Z 面上画一个亮盘（其他侧面不画，转起来能看到太阳出入视野）
+  if (face === 4) {
+    const sun = ctx.createRadialGradient(size/2, size*0.40, 0, size/2, size*0.40, size*0.16);
+    sun.addColorStop(0, 'rgba(255,250,220,1)');
+    sun.addColorStop(0.35, 'rgba(255,240,180,0.9)');
+    sun.addColorStop(1, 'rgba(255,240,180,0)');
+    ctx.fillStyle = sun;
+    ctx.fillRect(0, 0, size, size);
+  }
+  return cv;
+}
+
+const cubeTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubeTex);
+const FACE_SIZE = 256;
+const faces = [
+  gl.TEXTURE_CUBE_MAP_POSITIVE_X, gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+  gl.TEXTURE_CUBE_MAP_POSITIVE_Y, gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
+  gl.TEXTURE_CUBE_MAP_POSITIVE_Z, gl.TEXTURE_CUBE_MAP_NEGATIVE_Z
+];
+faces.forEach((f, i) => {
+  // 注意目标是 TEXTURE_CUBE_MAP_*，不再是 TEXTURE_2D
+  gl.texImage2D(f, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, drawSkyFace(i, FACE_SIZE));
+});
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.generateMipmap(gl.TEXTURE_CUBE_MAP);   // 6 面 256x256 POT，cubemap 也可以 mipmap
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+
+/* ==================================================================
+ * 几何：单位盒（天空盒用大 scale）+ 球（复用第 9 课的参数化）
+ * ================================================================== */
+const boxPos = new Float32Array([
+  -1,-1, 1,  1,-1, 1,  1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,  1,-1,-1,  1, 1,-1,  -1, 1,-1
+]);
+const boxIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,   1,5,6, 1,6,2,
+  4,0,3, 4,3,7,   3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+
+function makeSphere(radius, segments, rings) {
+  const positions = [], normals = [], indices = [];
+  for (let y = 0; y <= rings; y++) {
+    const phi = (y / rings) * Math.PI;
+    for (let x = 0; x <= segments; x++) {
+      const theta = (x / segments) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      positions.push(nx * radius, ny * radius, nz * radius);
+      normals.push(nx, ny, nz);
+    }
+  }
+  const rowLen = segments + 1;
+  for (let y = 0; y < rings; y++) {
+    for (let x = 0; x < segments; x++) {
+      const a = y * rowLen + x, b = a + rowLen;
+      indices.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint16Array(indices)
+  };
+}
+const sphere = makeSphere(1.3, 48, 32);
+
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+const boxPosBuf = buf(gl.ARRAY_BUFFER, boxPos);
+const boxIdxBuf = buf(gl.ELEMENT_ARRAY_BUFFER, boxIdx);
+const sphPosBuf = buf(gl.ARRAY_BUFFER, sphere.positions);
+const sphNorBuf = buf(gl.ARRAY_BUFFER, sphere.normals);
+const sphIdxBuf = buf(gl.ELEMENT_ARRAY_BUFFER, sphere.indices);
+
+/* uniforms / attributes */
+const skyAPos = gl.getAttribLocation(skyProgram, 'aPos');
+const skyView = gl.getUniformLocation(skyProgram, 'uViewRot');
+const skyProj = gl.getUniformLocation(skyProgram, 'uProj');
+const skyCube = gl.getUniformLocation(skyProgram, 'uCube');
+
+const ballAPos = gl.getAttribLocation(ballProgram, 'aPos');
+const ballANor = gl.getAttribLocation(ballProgram, 'aNormal');
+const bModel = gl.getUniformLocation(ballProgram, 'uModel');
+const bView  = gl.getUniformLocation(ballProgram, 'uView');
+const bProj  = gl.getUniformLocation(ballProgram, 'uProj');
+const bNorMat= gl.getUniformLocation(ballProgram, 'uNormalMat');
+const bCube  = gl.getUniformLocation(ballProgram, 'uCube');
+const bEye   = gl.getUniformLocation(ballProgram, 'uEye');
+
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubeTex);
+gl.uniform1i(skyCube, 0);
+gl.uniform1i(bCube, 0);
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+
+  const eye = [Math.cos(t * 0.18) * 4.6, 1.1 + Math.sin(t * 0.3) * 0.5, Math.sin(t * 0.18) * 4.6];
+  const view = M4.lookAt(eye, [0, 0.4, 0], [0, 1, 0]);
+  const proj = M4.perspective(55 * Math.PI / 180, canvas.width / canvas.height, 0.1, 200);
+
+  gl.clear(gl.DEPTH_BUFFER_BIT);   // 天空盒会覆盖所有颜色像素，不必清颜色
+
+  /* ---------------- Pass 1：天空盒 ----------------
+   * 用「去掉平移的视图矩阵」+ 大盒子。实际写法常见两种：
+   *   a) 先画天空（depthMask(false)），再画场景
+   *   b) 后画天空（gl.depthFunc(LEQUAL)，利用 z=w 压到最远）
+   * 本课用 b：天空盒顶点的 gl_Position 已把 z 设为 w（深度=1）。
+   * 注意从盒子内部看，所有面都是「背面」—— 必须先关掉背面剔除。 */
+  gl.useProgram(skyProgram);
+  gl.uniformMatrix4fv(skyView, false, M4.viewRotOnly(view));
+  gl.uniformMatrix4fv(skyProj, false, proj);
+  gl.depthFunc(gl.LEQUAL);          // 默认 LESS 会把深度=1 的天空盒整个剔掉
+  gl.depthMask(false);              // 天空盒不该写深度
+  gl.disable(gl.CULL_FACE);         // 内视角 = 全是背面，别剔除
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, boxPosBuf);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxIdxBuf);
+  gl.enableVertexAttribArray(skyAPos);
+  gl.vertexAttribPointer(skyAPos, 3, gl.FLOAT, false, 0, 0);
+  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+
+  gl.enable(gl.CULL_FACE);          // 恢复剔除，给球体 pass 用
+  gl.depthMask(true);
+  gl.depthFunc(gl.LESS);
+
+  /* ---------------- Pass 2：反射球 ---------------- */
+  gl.useProgram(ballProgram);
+  const model = M4.chain(
+    M4.translate(0, 0.4, 0),
+    M4.rotateY(t * 0.25),
+    M4.scale(1.05, 1.05, 1.05)
+  );
+  gl.uniformMatrix4fv(bModel, false, model);
+  gl.uniformMatrix4fv(bView, false, view);
+  gl.uniformMatrix4fv(bProj, false, proj);
+  gl.uniformMatrix3fv(bNorMat, false,
+    new Float32Array([model[0],model[1],model[2], model[4],model[5],model[6], model[8],model[9],model[10]]));
+  gl.uniform3fv(bEye, eye);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, sphPosBuf);
+  gl.enableVertexAttribArray(ballAPos);
+  gl.vertexAttribPointer(ballAPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, sphNorBuf);
+  gl.enableVertexAttribArray(ballANor);
+  gl.vertexAttribPointer(ballANor, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sphIdxBuf);
+  gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 进阶话题：
+ *   equirect / 全景图 -> cubemap 的转换（实际项目的天空来源）
+ *   HDR 环境贴图（RGBE / RGB16F）与 IBL（基于图像的光照）：
+ *     把 cubemap 拿来不只做反射，还做 diffuse irradiance + specular 的
+ *     预滤波 + BRDF LUT —— 第 24 课 PBR 的完整版就用它
+ *   内半球/抛物面贴图等其他环境表示
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

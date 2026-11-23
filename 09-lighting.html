@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · 光照：法线、Blinn-Phong 与法线矩阵</title>
+<!--
+  ============================================================
+  第 9 课：光照
+  ------------------------------------------------------------
+  到目前为止颜色都是我们自己给的。真实感来自「光照模型」：
+  同一个材质，因为法线朝向不同，亮度就不同。
+
+  本课新知识点：
+    1. 法线（normal）—— 表面朝向，光照计算的输入
+    2. 法线矩阵 = 模型矩阵左上 3x3 的「逆转置」
+    3. Blinn-Phong：环境光 + 漫反射 + 高光 + 边缘光
+    4. 程序化生成球体几何（正弦/余弦参数化）
+    5. 为什么要在着色器里把颜色做 gamma 校正
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 09</div>
+  <h1>光照：法线、Blinn-Phong 与法线矩阵</h1>
+  <p>球面几何由代码生成（48×32 网格）。光源在绕圈，高光和明暗交界线都是实时算的。</p>
+  <div class="tip">关键：法线要用「模型矩阵的逆转置」变换，否则非等比缩放下光照会错。</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（新增 normalMatrixFromMat4）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  scale: (x, y, z) => new Float32Array([x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  },
+
+  /* ----------------------------------------------------------------
+   * 法线矩阵：mat3(model) 的逆矩阵的转置
+   *
+   * 为什么不能直接用 mat3(model) 变换法线？
+   *   法线是「切平面」的垂线，不是方向向量。非等比缩放会把球压成椭球，
+   *   原本的法线会被斜着拉歪，导致明明该暗的地方发亮（经典 bug）。
+   *   用逆转置矩阵，可以保证「变换后的法线仍垂直于变换后的切线」。
+   *
+   * 若模型矩阵只含旋转 + 等比缩放，逆转置就等于 mat3(model) 除以缩放平方，
+   *   归一化后与 mat3(model) 等价 —— 所以很多教程偷懒直接乘，别学。
+   *
+   * 注意返回的是 mat3，列主序排列为 [列0, 列1, 列2]。
+   * ---------------------------------------------------------------- */
+  normalMatrixFromMat4(m) {
+    const a00 = m[0], a10 = m[1], a20 = m[2];
+    const a01 = m[4], a11 = m[5], a21 = m[6];
+    const a02 = m[8], a12 = m[9], a22 = m[10];
+
+    const b01 =  a22 * a11 - a12 * a21;
+    const b11 = -a22 * a10 + a12 * a20;
+    const b21 =  a21 * a10 - a11 * a20;
+
+    let det = a00 * b01 + a01 * b11 + a02 * b21;
+    if (!det) return new Float32Array([1,0,0, 0,1,0, 0,0,1]);   // 退化矩阵兜底
+    det = 1 / det;
+
+    // 3x3 伴随矩阵 * 1/det = 逆矩阵（下标 iRC 表示 第 R 行 第 C 列）
+    const i00 = b01 * det,                        i01 = (-a22 * a01 + a02 * a21) * det, i02 = ( a12 * a01 - a02 * a11) * det;
+    const i10 = b11 * det,                        i11 = ( a22 * a00 - a02 * a20) * det, i12 = (-a12 * a00 + a02 * a10) * det;
+    const i20 = b21 * det,                        i21 = (-a21 * a00 + a01 * a20) * det, i22 = ( a11 * a00 - a01 * a10) * det;
+
+    // 转置后写入（列主序）：第 c 列 = 逆矩阵第 c 行
+    return new Float32Array([i00, i01, i02,  i10, i11, i12,  i20, i21, i22]);
+  }
+};
+
+/* ==================================================================
+ * 着色器
+ * ----------------------------------------------------------------
+ * 顶点着色器输出两个 varying：
+ *   vNormal    世界空间法线（用于光照计算）
+ *   vWorldPos  世界空间位置（用于算视线方向，高光需要）
+ *
+ * 这里的 uModel 单独传，而不是和 proj/view 合成一个 mvp，
+ * 就是因为光照必须在「世界空间」里算。
+ * ================================================================== */
+const VERT_SRC = `
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform mat3 uNormalMat;
+
+  varying vec3 vNormal;
+  varying vec3 vWorldPos;
+
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos  = world.xyz;
+    // 注意：法线只做方向变换，不能加平移，所以用 mat3
+    vNormal    = normalize(uNormalMat * aNormal);
+
+    gl_Position = uProj * uView * world;
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+
+  varying vec3 vNormal;
+  varying vec3 vWorldPos;
+
+  uniform vec3  uLightPos;     // 点光源位置（世界空间）
+  uniform vec3  uLightColor;
+  uniform vec3  uBaseColor;    // 材质固有色
+  uniform vec3  uViewPos;      // 相机位置（世界空间），算高光要用
+  uniform float uShininess;
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uLightPos - vWorldPos);   // 表面 -> 光源
+    vec3 V = normalize(uViewPos - vWorldPos);    // 表面 -> 相机
+    vec3 H = normalize(L + V);                   // 半程向量（Blinn-Phong 的核心）
+
+    // 1) 环境光：假装有全局散射，避免背光面纯黑
+    float ambient = 0.10;
+
+    // 2) 漫反射：兰伯特余弦定律，法线与光线夹角越小越亮
+    float diff = max(dot(N, L), 0.0);
+
+    // 3) 高光：半程向量与法线越接近，高光越强。
+    //    pow 的指数越大，高光越"窄"、材质越像抛光金属。
+    //    乘 step 是为了避免背光面出现不该有的高光。
+    float spec = pow(max(dot(N, H), 0.0), uShininess) * step(0.0001, diff);
+
+    // 4) 边缘光：视线越"擦过"表面越亮，让轮廓更立体
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+    vec3 color = uBaseColor * (ambient + diff) * uLightColor
+               + vec3(1.0) * spec * 0.75
+               + vec3(0.32, 0.55, 0.95) * rim * 0.55;
+
+    // 这里直接做 gamma 校正：光照是在线性空间算的，
+    // 而屏幕按 sRGB 显示，不校正会让画面发灰、对比度被压扁。
+    // （若加了 HDR/泛光管线，这里通常换成ACES等色调映射，再接 gamma。）
+    color = pow(color, vec3(1.0 / 2.2));
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 程序化生成球体
+ * ----------------------------------------------------------------
+ * 用球坐标参数化：
+ *   theta ∈ [0, 2π)  绕 Y 轴的角度
+ *   phi   ∈ [0, π]   从北极到南极的角度
+ *   x = sin(phi)·cos(theta)
+ *   y = cos(phi)
+ *   z = sin(phi)·sin(theta)
+ *
+ * 单位球上，位置向量本身就是法线 —— 这是球体特别适合演示光照的原因。
+ * ================================================================== */
+function makeSphere(radius, segments, rings) {
+  const positions = [];
+  const normals = [];
+  const indices = [];
+
+  for (let y = 0; y <= rings; y++) {
+    const v = y / rings;
+    const phi = v * Math.PI;
+    for (let x = 0; x <= segments; x++) {
+      const u = x / segments;
+      const theta = u * Math.PI * 2;
+
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+
+      positions.push(nx * radius, ny * radius, nz * radius);
+      normals.push(nx, ny, nz);
+    }
+  }
+
+  const rowLen = segments + 1;
+  for (let y = 0; y < rings; y++) {
+    for (let x = 0; x < segments; x++) {
+      const a = y * rowLen + x;
+      const b = a + rowLen;
+      indices.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  }
+
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint16Array(indices)
+  };
+}
+
+// 48 × 32 的网格：约 1600 个顶点，9k 个三角形，肉眼已完全看不出棱角
+const sphere = makeSphere(1.3, 48, 32);
+
+/* 两块缓冲区：位置一块、法线一块（也可以交错，见第 4 课） */
+const posBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.bufferData(gl.ARRAY_BUFFER, sphere.positions, gl.STATIC_DRAW);
+
+const normBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+gl.bufferData(gl.ARRAY_BUFFER, sphere.normals, gl.STATIC_DRAW);
+
+const idxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.indices, gl.STATIC_DRAW);
+
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+
+const aNormalLoc = gl.getAttribLocation(program, 'aNormal');
+gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+gl.enableVertexAttribArray(aNormalLoc);
+gl.vertexAttribPointer(aNormalLoc, 3, gl.FLOAT, false, 0, 0);
+
+const uModelLoc     = gl.getUniformLocation(program, 'uModel');
+const uViewLoc      = gl.getUniformLocation(program, 'uView');
+const uProjLoc      = gl.getUniformLocation(program, 'uProj');
+const uNormalMatLoc = gl.getUniformLocation(program, 'uNormalMat');
+const uLightPosLoc  = gl.getUniformLocation(program, 'uLightPos');
+const uLightColorLoc= gl.getUniformLocation(program, 'uLightColor');
+const uBaseColorLoc = gl.getUniformLocation(program, 'uBaseColor');
+const uViewPosLoc   = gl.getUniformLocation(program, 'uViewPos');
+const uShininessLoc = gl.getUniformLocation(program, 'uShininess');
+
+/* ------------------------------------------------------------------
+ * 深度测试打开；背面剔除关掉：
+ * 球体是闭合的，剔除背面确实能省约一半像素，
+ * 但程序化网格的三角绕序容易搞反，教学代码先不引入这个变量。
+ * ------------------------------------------------------------------ */
+gl.enable(gl.DEPTH_TEST);
+
+const EYE = [0, 0.6, 4.2];
+const VIEW = M4.lookAt(EYE, [0, 0, 0], [0, 1, 0]);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.035, 0.042, 0.062, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(55 * Math.PI / 180, aspect, 0.1, 100);
+
+  // 故意用非等比缩放（y 方向拉长 1.25 倍），用来验证法线矩阵是否真的正确
+  const model = M4.chain(M4.rotateY(t * 0.5), M4.scale(1.0, 1.25, 1.0));
+
+  // 光源绕球做 8 字形运动，方便观察明暗交界线的移动
+  const lightPos = [
+    Math.cos(t * 0.9) * 3.2,
+    Math.sin(t * 1.6) * 1.8,
+    Math.sin(t * 0.9) * 3.2
+  ];
+
+  gl.uniformMatrix4fv(uModelLoc, false, model);
+  gl.uniformMatrix4fv(uViewLoc, false, VIEW);
+  gl.uniformMatrix4fv(uProjLoc, false, proj);
+  // uniformMatrix3fv 的最后一个参数是 mat3 数组
+  gl.uniformMatrix3fv(uNormalMatLoc, false, M4.normalMatrixFromMat4(model));
+
+  gl.uniform3fv(uLightPosLoc, lightPos);
+  gl.uniform3f(uLightColorLoc, 1.0, 0.96, 0.90);
+  gl.uniform3f(uBaseColorLoc, 0.16, 0.55, 0.82);
+  gl.uniform3fv(uViewPosLoc, EYE);
+  gl.uniform1f(uShininessLoc, 64.0);
+
+  gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 想继续深入的三个方向（都属于「光照」这一层）：
+ *   1. 多光源：把 diff/spec 累加起来，代码结构完全不变
+ *   2. 法线贴图：用一张 RGB 图扰动法线，平面也能有凹凸细节
+ *   3. PBR：把 Blinn-Phong 换成 微表面 BRDF + 金属度/粗糙度，
+ *      物理上更正确，也是现代引擎的默认方案
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

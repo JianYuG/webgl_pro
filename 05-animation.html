@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · 让它动起来：uniform 与动画循环</title>
+<!--
+  ============================================================
+  第 5 课：动画
+  ------------------------------------------------------------
+  本课新知识点：
+    1. requestAnimationFrame(RAF) 驱动的渲染循环
+    2. 用时间而不是帧数做动画（不同刷新率下速度一致）
+    3. 在顶点着色器里做旋转 —— 以及它为什么很快就不够用了
+
+  前四课的图形都是死的。GPU 每帧重画一遍，
+  所谓「动画」= 每帧给 GPU 一组新的 uniform 参数，再画一次。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+  .fps { position: fixed; right: 18px; top: 18px; font: 600 12px/1 ui-monospace, Consolas, monospace;
+         color: #58a6ff; background: rgba(13,17,23,.74); padding: 8px 10px; border-radius: 8px;
+         border: 1px solid rgba(255,255,255,.09); pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 05</div>
+  <h1>让它动起来：uniform 与动画循环</h1>
+  <p>三角形在自转 + 缩放呼吸。旋转角度由 CPU 每帧算好，用 uniform 送进顶点着色器。</p>
+  <div class="tip">按空格暂停 / 继续；切到别的标签页再回来，动画不会「跳帧」。</div>
+</div>
+<div class="fps" id="fps">-- fps</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ------------------------------------------------------------------
+ * 顶点着色器里做 2D 旋转
+ * ----------------------------------------------------------------
+ * 2D 旋转公式（数学上叫绕原点旋转 theta）：
+ *   x' = x·cosθ - y·sinθ
+ *   y' = x·sinθ + y·cosθ
+ *
+ * 只有旋转时这么写还行。一旦要「先缩放、再旋转、再平移到某个位置」，
+ * 就需要把它们逐层套起来写，代码会迅速失控，而且没法复用。
+ * 第 6 课用矩阵把这一串变换压成一个 4x4 矩阵，一次乘法搞定。
+ * ------------------------------------------------------------------ */
+const VERT_SRC = `
+  attribute vec2 aPos;
+  attribute vec3 aColor;
+
+  uniform float uAngle;      // 旋转角度（弧度）
+  uniform float uScale;      // 整体缩放
+
+  varying vec3 vColor;
+
+  void main() {
+    float c = cos(uAngle);
+    float s = sin(uAngle);
+
+    // GPU 上的 sin/cos 比 CPU 贵，但因为每个顶点只算一次，可以忽略。
+    // 顶点数很多时（百万级），反而更该把矩阵算好传来。
+    vec2 rotated = vec2(
+      aPos.x * c - aPos.y * s,
+      aPos.x * s + aPos.y * c
+    );
+
+    gl_Position = vec4(rotated * uScale, 0.0, 1.0);
+    vColor = aColor;
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec3 vColor;
+
+  void main() {
+    gl_FragColor = vec4(vColor, 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ------------------------------------------------------------------
+ * 几何：这次摆成一个更「有旋转感」的形状（三角形 + 一条尾巴）
+ * 直接复用交错缓冲区的写法。
+ * ------------------------------------------------------------------ */
+const data = new Float32Array([
+  // x      y      r     g     b
+   0.00,  0.62,   1.00, 0.42, 0.42,
+  -0.54, -0.36,   0.36, 0.80, 1.00,
+   0.54, -0.36,   0.72, 0.45, 1.00
+]);
+
+const STRIDE = 5 * 4;
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+
+const aPosLoc   = gl.getAttribLocation(program, 'aPos');
+const aColorLoc = gl.getAttribLocation(program, 'aColor');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, STRIDE, 0);
+gl.enableVertexAttribArray(aColorLoc);
+gl.vertexAttribPointer(aColorLoc, 3, gl.FLOAT, false, STRIDE, 2 * 4);
+
+const uAngleLoc = gl.getUniformLocation(program, 'uAngle');
+const uScaleLoc = gl.getUniformLocation(program, 'uScale');
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+/* ==================================================================
+ * 动画时钟
+ * ----------------------------------------------------------------
+ * 反面教材（很多人一开始都这么写）：
+ *     let angle = 0;
+ *     function loop() { angle += 0.02; ... }
+ *   问题：144Hz 屏幕上转速是 60Hz 的 2.4 倍，同一个页面在不同设备上速度不同。
+ *
+ * 正确做法：用「真实流逝的时间」驱动。
+ *   这里用 accumulated 累加式时钟，好处是暂停时只要不累加就行，
+ *   恢复后不会突然跳一大段（这正是切换标签页回来时的常见 bug）。
+ * ================================================================== */
+let accumulated = 0;      // 已经「播放」过的秒数
+let lastFrameTime = null; // 上一帧的时间戳
+let paused = false;
+
+function updateClock(now) {
+  if (lastFrameTime === null) lastFrameTime = now;
+  let dt = (now - lastFrameTime) / 1000;
+  lastFrameTime = now;
+
+  // 夹住单帧步长：切标签页 / 断点调试回来时 dt 可能是几十秒，
+  // 不夹住就会出现「瞬移」。
+  dt = Math.min(dt, 0.1);
+  if (!paused) accumulated += dt;
+  return accumulated;
+}
+
+/* FPS 统计：1 秒窗口内的帧数 */
+let fpsFrames = 0, fpsLast = performance.now();
+const fpsEl = document.getElementById('fps');
+
+function render(now) {
+  const t = updateClock(now);
+  resize();
+
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // 一切动画都从这里派生：想改速度就改系数
+  gl.uniform1f(uAngleLoc, t * 1.2);
+  gl.uniform1f(uScaleLoc, 0.72 + 0.10 * Math.sin(t * 2.0));
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // FPS 显示（每 500ms 更新一次，避免文字频繁抖动）
+  fpsFrames++;
+  if (now - fpsLast > 500) {
+    fpsEl.textContent = Math.round(fpsFrames * 1000 / (now - fpsLast)) + ' fps';
+    fpsFrames = 0; fpsLast = now;
+  }
+
+  requestAnimationFrame(render);
+}
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    paused = !paused;
+    e.preventDefault();
+  }
+});
+
+// 页面不可见时 RAF 本来就会停，回来时 lastFrameTime 是个很旧的值，
+// 上面的 dt 夹取会把这一帧的步长限死在 0.1s，所以不会瞬移。
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

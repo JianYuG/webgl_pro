@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>28C · 点 → 线 → 面：锚点长成线段与多边形</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #101218; }
+  #glcanvas { position: absolute; inset: 0; width: 100%; height: 100%;
+              display: block; cursor: crosshair; touch-action: none; }
+
+  #hud {
+    position: absolute; top: 16px; left: 16px; width: 236px;
+    background: rgba(18, 21, 30, 0.92); border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px; padding: 14px 16px; color: #dfe3ea;
+    font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+    backdrop-filter: blur(6px); user-select: none;
+  }
+  #hud h1 { font-size: 14px; letter-spacing: 1px; margin-bottom: 2px; }
+  #hud .sub { font-size: 11px; color: #8b93a5; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .label { font-size: 11px; color: #8b93a5; width: 40px; }
+
+  .swatch { width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+            border: 2px solid transparent; transition: transform .1s, border-color .1s; }
+  .swatch:hover { transform: scale(1.15); }
+  .swatch.active { border-color: #fff; transform: scale(1.15); }
+
+  .btn { flex: 1; padding: 6px 0; text-align: center; font-size: 12px;
+         background: rgba(255,255,255,0.07); color: #dfe3ea; border: 1px solid rgba(255,255,255,0.12);
+         border-radius: 7px; cursor: pointer; transition: background .12s; }
+  .btn:hover { background: rgba(255,255,255,0.14); }
+  .btn.active { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+
+  input[type=range] { flex: 1; accent-color: #2f6fed; }
+  #hint { margin-top: 12px; font-size: 11px; color: #6d7484; line-height: 1.7; }
+  #stats { margin-top: 8px; font-size: 11px; color: #52d273; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div id="hud">
+  <h1>WEBGL 矢量画板</h1>
+  <div class="sub">28C · 点 → 线 → 面</div>
+
+  <div class="row">
+    <span class="label">工具</span>
+    <div class="btn active" id="toolBrush">画笔</div>
+    <div class="btn" id="toolLine">线段</div>
+    <div class="btn" id="toolPoly">多边形</div>
+  </div>
+
+  <div class="row" id="modeRow">
+    <span class="label">笔刷</span>
+    <div class="btn active" id="modeSoft">软笔</div>
+    <div class="btn" id="modeNeon">霓虹</div>
+  </div>
+
+  <div class="row">
+    <span class="label">填充</span>
+    <div class="btn active" id="fillSolid">纯色</div>
+    <div class="btn" id="fillGrad">渐变</div>
+  </div>
+
+  <div class="row" id="colors"></div>
+
+  <div class="row">
+    <span class="label">粗细</span>
+    <input type="range" id="size" min="4" max="60" value="18">
+    <span id="sizeVal" style="width:22px;font-size:11px;color:#8b93a5">18</span>
+  </div>
+
+  <div class="row">
+    <div class="btn" id="undo">撤销 Ctrl+Z</div>
+    <div class="btn" id="clear">清空</div>
+  </div>
+
+  <div id="hint">
+    <b>画笔</b>：按住左键拖动<br>
+    <b>线段 / 多边形</b>：单击落锚点，实时预览；<br>
+    双击或 Enter 结束 · Esc 取消本次<br>
+    <b>渐变</b>：线段沿路径、多边形沿对角线；<br>
+    右键色板设终点色（默认自动互补色）<br>
+    [ / ] 调整粗细 · Ctrl+Z 撤销
+  </div>
+  <div id="stats"></div>
+</div>
+
+<script>
+/* ==================================================================
+ * 28C · 点 → 线 → 面 —— 同一批锚点，长成线段或多边形
+ * ==================================================================
+ * 28 课演示过「点、线、面是同一份数据的三种画法」，28B 把点做成了画笔。
+ * 本课把后两级也交给用户的手：
+ *
+ *   工具「线段」  → 锚点序列 → 每段展开成有宽度的四边形（2 个三角形）
+ *   工具「多边形」→ 锚点序列 → 三角扇填充 + 沿边一圈描边四边形
+ *
+ * 【为什么线段不用 gl.LINES？】
+ * WebGL1 规范把 lineWidth 锁死为 1 像素（大多数驱动直接忽略更大的值），
+ * 想要粗线只有两条路：
+ *   a) CPU 端把每段线「膨胀」成四边形 ← 本课选它，几何数据直接进 VBO
+ *   b) GPU 端在着色器里做法线外扩（three.js Line2 / FatLines 的做法）
+ * 选 a 是因为它只用到你已经学过的东西：一个方向向量 + 垂直偏移。
+ *
+ * 【为什么多边形填充用三角扇（TRIANGLE_FAN 思路，本课展开成 TRIANGLES）？】
+ * n 个顶点的凸多边形一定能拆成 n-2 个扇形三角形：
+ *      (v0, v1, v2) (v0, v2, v3) ... (v0, v[n-2], v[n-1])
+ * 凹多边形扇形会重叠/漏填，正确做法是耳切法（ear clipping）——
+ * 那是 21 课地形网格同一族问题，本课先不展开。
+ *
+ * 【渲染结构】三个 draw 组（混合状态只能按 draw 切换，14 课讲过）：
+ *   ① TRIANGLES 图层（线段四边形 + 多边形填充/描边）普通 alpha 混合
+ *   ② POINTS 软笔图层                                普通 alpha 混合
+ *   ③ POINTS 霓虹图层                                加色混合
+ *
+ * 【渐变填充为什么不用改着色器？】
+ * 04 课讲过：GPU 会对 varying 做逐片元线性插值——这是「免费」的渐变。
+ * 所以只需在 CPU 端给每个顶点算好颜色：
+ *   线段：沿路径长度渐变，t = 累计长度 / 总长（起点色 → 终点色）
+ *   多边形：包围盒对角线渐变，t = (dx + dy) / (spanX + spanY)
+ * 同一形状的填充和描边用同一个 t 函数，颜色严丝合缝地对上。
+ * 终点色默认自动取当前色的互补色（HSL 色相 +150°），
+ * 右键点击色板可手动指定终点色。
+ * ================================================================== */
+
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { antialias: true });
+if (!gl) { document.getElementById('hint').textContent = '当前浏览器不支持 WebGL'; throw new Error('no webgl'); }
+
+/* ---------------- 着色器：两套程序 ----------------
+ * 点精灵程序（28B 同款）：带 gl_PointSize 和 gl_PointCoord 软边
+ * 纯色程序（新）：线段四边形和多边形填充就是普通三角形，逐顶点色即可 */
+const VS_POINTS = `
+  attribute vec2  aPos;
+  attribute float aSize;
+  attribute float aMode;
+  attribute vec4  aColor;
+
+  uniform vec2 uRes;
+  varying vec4  vColor;
+  varying float vMode;
+
+  void main() {
+    vec2 clip = (aPos / uRes * 2.0 - 1.0) * vec2(1.0, -1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    gl_PointSize = clamp(aSize, 1.0, 64.0);
+    vColor = aColor;
+    vMode  = aMode;
+  }
+`;
+const FS_POINTS = `
+  precision mediump float;
+  varying vec4  vColor;
+  varying float vMode;
+
+  void main() {
+    vec2  d = gl_PointCoord * 2.0 - 1.0;
+    float r = length(d);
+    float soft = smoothstep(1.0, 0.45, r);
+    float neon = smoothstep(1.0, 0.0, r) * smoothstep(0.0, 0.35, r);
+    float a = mix(soft, neon, vMode);
+    if (a < 0.004) discard;
+    gl_FragColor = vec4(vColor.rgb, vColor.a * a);
+  }
+`;
+
+/* 纯色程序：位置 + 逐顶点 RGBA，没有别的花活 */
+const VS_FLAT = `
+  attribute vec2 aPos;
+  attribute vec4 aColor;
+
+  uniform vec2 uRes;
+  varying vec4 vColor;
+
+  void main() {
+    vec2 clip = (aPos / uRes * 2.0 - 1.0) * vec2(1.0, -1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    vColor = aColor;
+  }
+`;
+const FS_FLAT = `
+  precision mediump float;
+  varying vec4 vColor;
+  void main() { gl_FragColor = vColor; }
+`;
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('shader: ' + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+function linkProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error('link: ' + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+const progPoints = linkProgram(VS_POINTS, FS_POINTS);
+const progFlat   = linkProgram(VS_FLAT, FS_FLAT);
+
+/* 两套程序的 uniform / attribute 位置各取各的 */
+const P = {
+  aPos:   gl.getAttribLocation(progPoints, 'aPos'),
+  aSize:  gl.getAttribLocation(progPoints, 'aSize'),
+  aMode:  gl.getAttribLocation(progPoints, 'aMode'),
+  aColor: gl.getAttribLocation(progPoints, 'aColor'),
+  uRes:   gl.getUniformLocation(progPoints, 'uRes')
+};
+const F = {
+  aPos:   gl.getAttribLocation(progFlat, 'aPos'),
+  aColor: gl.getAttribLocation(progFlat, 'aColor'),
+  uRes:   gl.getUniformLocation(progFlat, 'uRes')
+};
+gl.enableVertexAttribArray(P.aPos);
+gl.enableVertexAttribArray(P.aSize);
+gl.enableVertexAttribArray(P.aMode);
+gl.enableVertexAttribArray(P.aColor);
+gl.enableVertexAttribArray(F.aPos);
+gl.enableVertexAttribArray(F.aColor);
+
+/* ---------------- 数据层 ----------------
+ * 点图层：28B 同款交错布局，每盖章点 8 个 float
+ * 面图层：每顶点 6 个 float [x, y, r, g, b, a]
+ * 三块 VBO 全部在初始化时按容量预分配（28B 踩过的 buffer overflow 坑） */
+const FPV = 8, BYTES = FPV * 4;
+const FPV6 = 6, BYTES6 = FPV6 * 4;
+const CAP   = 120000;        // 每个点图层容量（盖章数）
+const CAP6  = 200000;        // 面图层容量（顶点数，约 4.8MB）
+
+const layers = {
+  soft: { data: new Float32Array(CAP * FPV),  count: 0, uploaded: 0, buf: gl.createBuffer() },
+  neon: { data: new Float32Array(CAP * FPV),  count: 0, uploaded: 0, buf: gl.createBuffer() }
+};
+const tri = { data: new Float32Array(CAP6 * FPV6), count: 0, uploaded: 0, buf: gl.createBuffer() };
+
+for (const k in layers) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, layers[k].buf);
+  gl.bufferData(gl.ARRAY_BUFFER, layers[k].data.byteLength, gl.DYNAMIC_DRAW);
+}
+gl.bindBuffer(gl.ARRAY_BUFFER, tri.buf);
+gl.bufferData(gl.ARRAY_BUFFER, tri.data.byteLength, gl.DYNAMIC_DRAW);
+
+/* 预览缓冲：正在画的多边形/线段还没「定稿」，画在小缓冲里，
+ * 每帧用 bufferData 整块替换（STREAM_DRAW：用一次就扔的数据） */
+const PRE_CAP = 8192;        // float 数，够 64 个锚点的扇形 + 描边
+const previewData = new Float32Array(PRE_CAP);
+const previewBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, previewBuf);
+gl.bufferData(gl.ARRAY_BUFFER, previewData.byteLength, gl.DYNAMIC_DRAW);
+
+/* 撤销栈：两种条目
+ *   { kind:'stamp', layer, start }  → 点图层回退到 start
+ *   { kind:'shape', start }         → 面图层回退到 start */
+const strokes = [];
+
+/* ---------------- 笔刷 / 工具状态 ---------------- */
+const brush = { color: [0.30, 0.59, 0.99, 0.85], size: 18, mode: 'soft' };
+const grad  = { on: false, colorB: null };   // 渐变开关 + 手动指定的终点色（null = 自动互补色）
+const state = { tool: 'brush' };
+let anchors = [];            // 线段/多边形的锚点（CSS 像素）
+let cursor = null;           // 鼠标当前位置（CSS 像素），驱动预览
+
+/* ---------------- 颜色工具：HSL 互补色 + 渐变混合 ----------------
+ * RGB ↔ HSL 转换是调色的基本功：色相 h ∈ [0,1] 转一圈，
+ * 旋转色相就能得到视觉上「配一套」的颜色，比 RGB 里乱减分量靠谱得多 */
+function rgb2hsl(r, g, b) {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let h = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+    else if (max === g) h = ((b - r) / d + 2) / 6;
+    else                h = ((r - g) / d + 4) / 6;
+  }
+  return [h, s, l];
+}
+function hsl2rgb(h, s, l) {
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const hue = t => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q - p) * 6 * t;
+    if (t < 1/2) return q;
+    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+    return p;
+  };
+  return [hue(h + 1/3), hue(h), hue(h - 1/3)];
+}
+/* 互补色：色相 +150°（避开正对面 180° 的死板感，偏一点更耐看） */
+function complementary(rgb) {
+  const [h, s, l] = rgb2hsl(rgb[0], rgb[1], rgb[2]);
+  return hsl2rgb((h + 150 / 360) % 1, s, l);
+}
+/* 渐变终点色：手动指定优先，否则自动互补 */
+function gradB() { return grad.colorB || complementary(brush.color); }
+const mixRGB = (a, b, t) => [
+  a[0] + (b[0] - a[0]) * t,
+  a[1] + (b[1] - a[1]) * t,
+  a[2] + (b[2] - a[2]) * t
+];
+/* rgb + 独立 alpha → 顶点色（渐变只混 RGB，透明度由用途决定：
+ * 填充淡、描边实，两层渐变颜色才能对得上） */
+const withA = (rgb, a) => [rgb[0], rgb[1], rgb[2], a];
+
+/* 渐变参数：给一组锚点逐个算出 t ∈ [0,1]
+ *   line：沿路径累计长度 / 总长（一笔从头渐到尾）
+ *   poly：包围盒对角线归一化（左上 → 右下）
+ * 关闭渐变时全部返回 0 → 每个顶点都是起点色 = 纯色模式 */
+function gradT(kind, pts) {
+  const A = brush.color;
+  if (!grad.on) return pts.map(() => 0);
+  if (kind === 'line') {
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) {
+      cum.push(cum[i-1] + Math.hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y));
+    }
+    const total = Math.max(1e-6, cum[cum.length - 1]);
+    return cum.map(c => c / total);
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  }
+  const denom = Math.max(1e-6, (maxX - minX) + (maxY - minY));
+  return pts.map(p => ((p.x - minX) + (p.y - minY)) / denom);
+}
+
+/* ---------------- 通用几何：点/面写入 ---------------- */
+let dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth  * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    dirty = true;
+  }
+}
+
+function pushStamp(layer, x, y, size, mode) {
+  if (layer.count >= CAP) return false;
+  const o = layer.count * FPV, d = layer.data;
+  d[o] = x; d[o+1] = y;
+  d[o+2] = size; d[o+3] = mode;
+  d[o+4] = brush.color[0]; d[o+5] = brush.color[1];
+  d[o+6] = brush.color[2]; d[o+7] = brush.color[3];
+  layer.count++;
+  return true;
+}
+
+/* 往任意 Float32Array 的 float 偏移 v 处写一个三角形（3 顶点 × 6 float），
+ * 每个顶点各带自己的颜色 p = { x, y, c: [r,g,b,a] }——渐变就藏在这里，
+ * GPU 拿到三个不同的颜色后，varying 插值自动把中间填成渐变。
+ * 点图层/预览缓冲共用这一个函数，避免两份拷贝代码 */
+function pushTri(arr, v, p1, p2, p3) {
+  if (v + 18 > arr.length) return v;                 // 容量守卫：满了静默丢弃
+  const w = (i, p) => {
+    arr[i] = p.x; arr[i+1] = p.y;
+    arr[i+2] = p.c[0]; arr[i+3] = p.c[1]; arr[i+4] = p.c[2]; arr[i+5] = p.c[3];
+  };
+  w(v, p1); w(v + 6, p2); w(v + 12, p3);
+  return v + 18;
+}
+
+/* 【核心几何】把线段 A→B 膨胀成宽 2*halfW 的四边形，返回写入后的偏移。
+ * 数学只有一步：单位方向向量旋转 90° 得法线 n = (-dy, dx)/len，
+ * A/B 各沿 ±n 偏移 halfW 就得到四个角，拆两个三角形。
+ * 端点颜色随角点带走，长线段两头颜色不同 → 天然沿路径渐变。
+ * len<0.5 的退化段（比如双击产生的重复锚点）直接跳过 */
+function pushQuad(arr, v, a, b, halfW) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.5) return v;
+  const nx = -dy / len * halfW, ny = dx / len * halfW;
+  const at = (p, sx, sy) => ({ x: p.x + sx, y: p.y + sy, c: p.c });
+  v = pushTri(arr, v,  at(a, nx, ny),  at(b, nx, ny),  at(a, -nx, -ny));
+  v = pushTri(arr, v,  at(b, nx, ny),  at(b, -nx, -ny), at(a, -nx, -ny));
+  return v;
+}
+
+/* 三角扇填充：凸多边形 (v0..vn-1) 拆出 n-2 个共享 v0 的三角形，
+ * 每个顶点带自己的渐变色 */
+function pushFan(arr, v, pts) {
+  for (let i = 1; i < pts.length - 1; i++) {
+    v = pushTri(arr, v, pts[0], pts[i], pts[i+1]);
+  }
+  return v;
+}
+
+/* 给点列表按渐变参数上色（坐标换算到设备像素） */
+function colorize(pts, tArr, alpha) {
+  const A = brush.color, B = gradB();
+  return pts.map((p, i) => ({
+    x: p.x * dpr, y: p.y * dpr,
+    c: withA(mixRGB(A, B, tArr[i]), alpha)
+  }));
+}
+
+/* 把定稿的形状烤进面图层 */
+function bakeShape(pts, kind) {
+  const halfW = Math.max(1.5, brush.size * 0.5 * dpr);
+  const P2 = pts.map(p => ({ x: p.x * dpr, y: p.y * dpr }));
+  /* 渐变 t 在「定稿几何」上算一次，填充和描边共用同一组 t，
+   * 保证两层颜色严丝合缝 */
+  const tArr = gradT(kind, P2);
+  const fillA = kind === 'poly' ? 0.32 : 0.9;
+  const lineA = 0.9;
+  const C = colorize(P2, tArr, 0);                   // 先带 rgb，alpha 下面按角色覆盖
+  let v = tri.count * FPV6;
+
+  if (kind === 'poly') {
+    v = pushFan(tri.data, v, C.map(p => ({ x: p.x, y: p.y, c: withA(p.c, fillA) })));
+  }
+  for (let i = 0; i < C.length - 1; i++) {
+    v = pushQuad(tri.data, v,
+      { x: C[i].x,   y: C[i].y,   c: withA(C[i].c,   lineA) },
+      { x: C[i+1].x, y: C[i+1].y, c: withA(C[i+1].c, lineA) }, halfW);
+  }
+  /* 面图层按 float 偏移记账，undo 条目记回退点 */
+  strokes.push({ kind: 'shape', start: tri.count });
+  tri.count = v / FPV6;
+  dirty = true;
+}
+
+/* ---------------- 指针事件 ---------------- */
+let drawing = false;
+let last = null;
+let smSize = brush.size;
+let lastT = performance.now();
+
+/* 画笔工具：28B 原样 —— 间距插值盖章 + 速度感应笔宽 */
+function strokeTo(x, y) {
+  const layer = layers[brush.mode];
+  const dx = x - last.x, dy = y - last.y;
+  const dist = Math.hypot(dx, dy);
+  const spacing = Math.max(1.5, brush.size * 0.14);
+  const steps = Math.max(1, Math.ceil(dist / spacing));
+  for (let i = 1; i <= steps; i++) {
+    pushStamp(layer, (last.x + dx * i / steps) * dpr, (last.y + dy * i / steps) * dpr,
+              smSize, brush.mode === 'neon' ? 1 : 0);
+  }
+  last = { x, y };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+
+  if (state.tool === 'brush') {
+    canvas.setPointerCapture(e.pointerId);
+    drawing = true;
+    smSize = brush.size;
+    last = { x: e.offsetX, y: e.offsetY };
+    pushStamp(layers[brush.mode], e.offsetX * dpr, e.offsetY * dpr, brush.size, brush.mode === 'neon' ? 1 : 0);
+    strokes.push({ kind: 'stamp', layer: brush.mode, start: layers[brush.mode].count - 1 });
+    dirty = true;
+    return;
+  }
+
+  /* 线段/多边形工具：单击落一个锚点。
+   * 距上一个锚点 <3px 时忽略——防止双击结束时重复落点产生退化段 */
+  const x = e.offsetX, y = e.offsetY;
+  const la = anchors[anchors.length - 1];
+  if (la && Math.hypot(x - la.x, y - la.y) < 3) return;
+  if (anchors.length >= 64) return;                  // 单个形状最多 64 锚点
+  anchors.push({ x, y });
+  cursor = { x, y };
+  dirty = true;
+});
+
+canvas.addEventListener('pointermove', e => {
+  const x = e.offsetX, y = e.offsetY;
+
+  if (state.tool === 'brush') {
+    if (!drawing) return;
+    const now = performance.now();
+    const dt = Math.max(1, now - lastT);
+    lastT = now;
+    const speed = Math.hypot(x - last.x, y - last.y) / dt;
+    const target = brush.size * Math.min(1.25, Math.max(0.35, 1.25 - speed * 0.05));
+    smSize += (target - smSize) * 0.3;
+    strokeTo(x, y);
+  } else {
+    cursor = { x, y };                               // 非画笔工具：移动只刷新预览
+  }
+  dirty = true;
+});
+
+function endStroke() {
+  if (!drawing) return;
+  drawing = false;
+  const s = strokes[strokes.length - 1];
+  if (s && s.kind === 'stamp') s.count = layers[s.layer].count - s.start;
+}
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+/* 双击结束当前形状（dblclick 前会先触发两次 click 落点，上面的
+ * 3px 去重保证不会塞进重复锚点） */
+canvas.addEventListener('dblclick', () => finishShape());
+
+function finishShape() {
+  if (state.tool === 'line' && anchors.length >= 2) bakeShape(anchors, 'line');
+  else if (state.tool === 'poly' && anchors.length >= 3) bakeShape(anchors, 'poly');
+  anchors = [];                                      // 不管成没成，都清空重新开始
+  dirty = true;
+}
+function cancelShape() { anchors = []; dirty = true; }
+
+/* ---------------- 撤销 / 清空 ---------------- */
+function undo() {
+  const s = strokes.pop();
+  if (!s) return;
+  if (s.kind === 'stamp') {
+    const layer = layers[s.layer];
+    layer.count = s.start;
+    layer.uploaded = 0;
+  } else {
+    tri.count = s.start;
+    tri.uploaded = 0;
+  }
+  cancelShape();
+  dirty = true;
+}
+function clearAll() {
+  strokes.length = 0;
+  for (const k in layers) { layers[k].count = 0; layers[k].uploaded = 0; }
+  tri.count = 0; tri.uploaded = 0;
+  cancelShape();
+  dirty = true;
+}
+
+/* ---------------- 工具面板 ---------------- */
+const PALETTE = [
+  ['#f2f4f8', '白'], ['#ff5d5d', '红'], ['#ff9f43', '橙'], ['#ffd93d', '黄'],
+  ['#6bcb77', '绿'], ['#4d96ff', '蓝'], ['#b58cff', '紫'], ['#2ee6d6', '青']
+];
+const colorsEl = document.getElementById('colors');
+PALETTE.forEach(([hex], i) => {
+  const b = document.createElement('div');
+  b.className = 'swatch' + (i === 5 ? ' active' : '');
+  b.style.background = hex;
+  b.title = hex + '（右键：设为渐变终点色）';
+  const rgb = [
+    parseInt(hex.slice(1, 3), 16) / 255,
+    parseInt(hex.slice(3, 5), 16) / 255,
+    parseInt(hex.slice(5, 7), 16) / 255
+  ];
+  b.onclick = () => {
+    brush.color = [rgb[0], rgb[1], rgb[2], brush.mode === 'neon' ? 0.55 : 0.85];
+    colorsEl.querySelectorAll('.swatch').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    dirty = true;
+  };
+  /* 右键 = 把这块颜色设为渐变终点色。橙色描边标记当前终点 */
+  b.oncontextmenu = e => {
+    e.preventDefault();
+    grad.colorB = [rgb[0], rgb[1], rgb[2]];
+    colorsEl.querySelectorAll('.swatch').forEach(x => { x.style.boxShadow = ''; });
+    b.style.boxShadow = '0 0 0 3px rgba(255,159,67,.95)';
+    dirty = true;
+  };
+  colorsEl.appendChild(b);
+});
+
+const sizeEl = document.getElementById('size');
+const sizeVal = document.getElementById('sizeVal');
+sizeEl.oninput = () => { brush.size = +sizeEl.value; sizeVal.textContent = sizeEl.value; };
+
+function setMode(m) {
+  brush.mode = m;
+  document.getElementById('modeSoft').classList.toggle('active', m === 'soft');
+  document.getElementById('modeNeon').classList.toggle('active', m === 'neon');
+}
+document.getElementById('modeSoft').onclick = () => setMode('soft');
+document.getElementById('modeNeon').onclick = () => setMode('neon');
+
+function setGrad(on) {
+  grad.on = on;
+  document.getElementById('fillSolid').classList.toggle('active', !on);
+  document.getElementById('fillGrad').classList.toggle('active', on);
+  dirty = true;
+}
+document.getElementById('fillSolid').onclick = () => setGrad(false);
+document.getElementById('fillGrad').onclick  = () => setGrad(true);
+
+function setTool(t) {
+  state.tool = t;
+  cancelShape();                                     // 换工具丢弃未完成的锚点
+  document.getElementById('toolBrush').classList.toggle('active', t === 'brush');
+  document.getElementById('toolLine').classList.toggle('active', t === 'line');
+  document.getElementById('toolPoly').classList.toggle('active', t === 'poly');
+  /* 画笔专属的软笔/霓虹切换在矢量工具下无意义，直接隐藏减少干扰 */
+  document.getElementById('modeRow').style.display = t === 'brush' ? 'flex' : 'none';
+  dirty = true;
+}
+document.getElementById('toolBrush').onclick = () => setTool('brush');
+document.getElementById('toolLine').onclick  = () => setTool('line');
+document.getElementById('toolPoly').onclick  = () => setTool('poly');
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = clearAll;
+
+window.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+  if (e.key === 'Enter') finishShape();
+  if (e.key === 'Escape') cancelShape();
+  if (e.key === '[') { sizeEl.value = Math.max(4, brush.size - 4); sizeEl.oninput(); }
+  if (e.key === ']') { sizeEl.value = Math.min(60, brush.size + 4); sizeEl.oninput(); }
+});
+
+/* ---------------- 渲染：按需渲染，三组 draw ---------------- */
+let dirty = true;
+
+function uploadTriLayer() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, tri.buf);
+  if (tri.count > tri.uploaded) {
+    gl.bufferSubData(gl.ARRAY_BUFFER, tri.uploaded * BYTES6,
+                     tri.data.subarray(tri.uploaded * FPV6, tri.count * FPV6));
+    tri.uploaded = tri.count;
+  } else if (tri.uploaded > tri.count) {             // 撤销后变短：从 0 重传存活数据
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+                     tri.data.subarray(0, tri.count * FPV6));
+    tri.uploaded = tri.count;
+  }
+}
+
+const statsEl = document.getElementById('stats');
+function render() {
+  if (!dirty) return;
+  dirty = false;
+
+  gl.clearColor(0.063, 0.071, 0.094, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.disable(gl.DEPTH_TEST);
+
+  /* ---- draw ①：面图层 + 预览（TRIANGLES，普通 alpha 混合） ---- */
+  gl.useProgram(progFlat);
+  gl.uniform2f(F.uRes, canvas.width, canvas.height);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, tri.buf);
+  uploadTriLayer();
+  gl.vertexAttribPointer(F.aPos,   2, gl.FLOAT, false, BYTES6, 0);
+  gl.vertexAttribPointer(F.aColor, 4, gl.FLOAT, false, BYTES6, 8);
+  if (tri.count > 0) gl.drawArrays(gl.TRIANGLES, 0, tri.count);
+
+  /* 预览：锚点 ≥1 且鼠标在画布上才画。数据每帧整块重传（小且易变，
+   * STREAM_DRAW 正是给这种「写一次用一次」的数据用的提示） */
+  if (state.tool !== 'brush' && anchors.length > 0 && cursor) {
+    const pts = anchors.concat([cursor]);
+    const kind = state.tool;                         // 'line' | 'poly'
+    const halfW = Math.max(1.5, brush.size * 0.5 * dpr);
+    /* 预览与定稿用同一套 gradT/colorize：光标作为最后一个点参与
+     * 计算 t，渐变色会跟着鼠标实时流动 */
+    const tArr = gradT(kind, pts);
+    const fillA = kind === 'poly' ? 0.22 : 0.5;
+    const ghostA = 0.5;
+    const C = colorize(pts, tArr, 0);
+    let v = 0;
+    if (kind === 'poly') {
+      v = pushFan(previewData, v, C.map(p => ({ x: p.x, y: p.y, c: withA(p.c, fillA) })));
+    }
+    for (let i = 0; i < C.length - 1; i++) {
+      v = pushQuad(previewData, v,
+        { x: C[i].x,   y: C[i].y,   c: withA(C[i].c,   ghostA) },
+        { x: C[i+1].x, y: C[i+1].y, c: withA(C[i+1].c, ghostA) }, halfW);
+    }
+    if (v > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, previewBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, previewData.subarray(0, v), gl.STREAM_DRAW);
+      gl.vertexAttribPointer(F.aPos,   2, gl.FLOAT, false, BYTES6, 0);
+      gl.vertexAttribPointer(F.aColor, 4, gl.FLOAT, false, BYTES6, 8);
+      gl.drawArrays(gl.TRIANGLES, 0, v / FPV6);
+    }
+  }
+
+  /* ---- draw ②③：点图层（28B 的画笔） ---- */
+  gl.useProgram(progPoints);
+  gl.uniform2f(P.uRes, canvas.width, canvas.height);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  for (const k of ['soft', 'neon']) {
+    const layer = layers[k];
+    gl.bindBuffer(gl.ARRAY_BUFFER, layer.buf);
+    if (layer.count > layer.uploaded) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, layer.uploaded * BYTES,
+                       layer.data.subarray(layer.uploaded * FPV, layer.count * FPV));
+      layer.uploaded = layer.count;
+    } else if (layer.uploaded > layer.count) {
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+                       layer.data.subarray(0, layer.count * FPV));
+      layer.uploaded = layer.count;
+    }
+    gl.vertexAttribPointer(P.aPos,   2, gl.FLOAT, false, BYTES,  0);
+    gl.vertexAttribPointer(P.aSize,  1, gl.FLOAT, false, BYTES,  8);
+    gl.vertexAttribPointer(P.aMode,  1, gl.FLOAT, false, BYTES, 12);
+    gl.vertexAttribPointer(P.aColor, 4, gl.FLOAT, false, BYTES, 16);
+    if (layer.count > 0) gl.drawArrays(gl.POINTS, 0, layer.count);
+  }
+
+  statsEl.textContent =
+    `stamps ${layers.soft.count + layers.neon.count} · tris ${tri.count} · anchors ${anchors.length}`;
+}
+
+window.addEventListener('resize', resize);
+resize();
+function frame() {
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

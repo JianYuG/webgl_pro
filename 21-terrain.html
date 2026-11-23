@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>21 · 程序化地形：高度场与法线计算</title>
+<!--
+  ============================================================
+  第 21 课：程序化地形（Terrain / Heightfield）
+  ------------------------------------------------------------
+  地形是学习「运行时生成几何」的最佳案例：
+    一个 XZ 网格 + 高度函数 h(x,z) => 一整片山川。
+  引擎里的开放世界、粒子高度碰撞、水体网格，全是同一套思路。
+
+  本课新知识点：
+    1. 高度场网格的生成循环（顶点数 (N+1)²，索引数 N²×6）
+    2. 值噪声 + fBm（分形布朗运动）：多个倍频叠加出自然起伏
+    3. 从高度场算法线：中心差分 ∂h/∂x、∂h/∂z
+    4. 按高度/坡度调色（雪线、岩石、草地）—— vertex color
+    5. Uint16 索引的上限意识与网格密度取舍
+
+  地形每帧不变，所以几何生成一次就够 —— 静态几何 STATIC_DRAW。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 21</div>
+  <h1>程序化地形：高度场与法线计算</h1>
+  <p>128×128 网格由 fBm 噪声一次生成，法线由高度差分算出，颜色按海拔和坡度分层。</p>
+  <div class="tip">几何只生成一次（STATIC_DRAW）· 光照用的是差分法线</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(`
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  attribute vec3 aColor;      // 顶点色：地形颜色在 CPU 侧按海拔/坡度算好
+
+  uniform mat4 uView;
+  uniform mat4 uProj;
+
+  varying vec3 vNormal;
+  varying vec3 vColor;
+  varying vec3 vWorldPos;
+
+  void main() {
+    // 地形不动的花招：把「模型矩阵 = identity」直接省略
+    vNormal = aNormal;
+    vColor = aColor;
+    vWorldPos = aPos;
+    gl_Position = uProj * uView * vec4(aPos, 1.0);
+  }
+`, `
+  precision mediump float;
+
+  varying vec3 vNormal;
+  varying vec3 vColor;
+  varying vec3 vWorldPos;
+
+  uniform vec3 uLightDir;
+  uniform vec3 uEye;
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uLightDir);
+    float diff = max(dot(N, L), 0.0);
+
+    vec3 V = normalize(uEye - vWorldPos);
+
+    /* 距离雾：距离越远越接近天色。
+     * 地形没有边界，雾是让网格边缘「融进背景」最便宜的手段。 */
+    float dist = length(uEye - vWorldPos);
+    float fog = 1.0 - exp(-dist * 0.028);
+
+    vec3 color = vColor * (0.18 + 0.82 * diff);
+    // 天空色（和 clear 色一致，雾才无缝）
+    vec3 sky = vec3(0.35, 0.48, 0.66);
+    color = mix(color, sky, fog);
+
+    color = pow(color, vec3(1.0/2.2));
+    gl_FragColor = vec4(color, 1.0);
+  }
+`);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 值噪声 + fBm
+ * ----------------------------------------------------------------
+ * 值噪声：格点上放伪随机值，格点之间用 smoothstep 插值。
+ * fBm：把多个「频率×2、振幅×0.5」的噪声叠起来 ——
+ *   大起伏（山）+ 中起伏（丘）+ 小起伏（碎石）就是自然地貌的感觉。
+ * ================================================================== */
+function makeNoise2D(seed) {
+  // 整数格点的确定性伪随机（把坐标打散进大质数运算）
+  function hash(ix, iz) {
+    let h = ix * 374761393 + iz * 668265263 + seed * 1442695041;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h = h ^ (h >> 16);
+    return (h & 0x7fffffff) / 0x7fffffff;    // 0..1
+  }
+  const smooth = t => t * t * (3 - 2 * t);
+  return function noise(x, z) {
+    const ix = Math.floor(x), iz = Math.floor(z);
+    const fx = smooth(x - ix), fz = smooth(z - iz);
+    const a = hash(ix, iz),     b = hash(ix + 1, iz);
+    const c = hash(ix, iz + 1), d = hash(ix + 1, iz + 1);
+    return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
+  };
+}
+
+function fbm(noise, x, z, octaves) {
+  let sum = 0, amp = 1, freq = 1, norm = 0;
+  for (let i = 0; i < octaves; i++) {
+    sum += noise(x * freq, z * freq) * amp;
+    norm += amp;
+    amp *= 0.5;
+    freq *= 2.1;      // 略大于 2，避免各倍频花纹重叠
+  }
+  return sum / norm;
+}
+
+/* ==================================================================
+ * 生成地形网格
+ * ----------------------------------------------------------------
+ * (N+1)² 个顶点、N²×6 个索引。N=128 时顶点 16641 个 ——
+ * Uint16 最大 65535，所以「索引值」还在安全区；若要更细的网格，
+ * 要么分块（chunk），要么换 Uint32（需要 OES_element_index_uint）。
+ * ================================================================== */
+const N = 128;            // 网格数
+const SIZE = 30;          // 世界尺寸
+const HEIGHT = 3.2;       // 最大高差
+
+function buildTerrain() {
+  const noise = makeNoise2D(7);
+  const positions = new Float32Array((N + 1) * (N + 1) * 3);
+  const heights = new Float32Array((N + 1) * (N + 1));
+
+  // -- Pass 1：位置（先存高度，供法线差分用）--
+  for (let z = 0; z <= N; z++) {
+    for (let x = 0; x <= N; x++) {
+      const u = x / N, v = z / N;
+      const wx = (u - 0.5) * SIZE;
+      const wz = (v - 0.5) * SIZE;
+      // 中心加一座主峰：让画面有主角
+      const ridge = Math.exp(-((wx * wx + wz * wz) / 60)) * 2.2;
+      const h = fbm(noise, u * 5, v * 5, 5) * HEIGHT + ridge - 0.9;
+      const i = z * (N + 1) + x;
+      positions[i * 3]     = wx;
+      positions[i * 3 + 1] = h;
+      positions[i * 3 + 2] = wz;
+      heights[i] = h;
+    }
+  }
+
+  const cell = SIZE / N;
+  const normals = new Float32Array(positions.length);
+  // -- Pass 2：法线 = normalize(-∂h/∂x, 1, -∂h/∂z) --
+  // 推导：表面 y=h(x,z) 即 h(x,z)-y=0，梯度 (dh/dx, -1, dh/dz)，
+  // 取反归一化即得朝上的法线。网格整齐，用中心差分近似偏导。
+  for (let z = 0; z <= N; z++) {
+    for (let x = 0; x <= N; x++) {
+      const i = z * (N + 1) + x;
+      const hl = heights[z * (N + 1) + Math.max(x - 1, 0)];
+      const hr = heights[z * (N + 1) + Math.min(x + 1, N)];
+      const hd = heights[Math.max(z - 1, 0) * (N + 1) + x];
+      const hu = heights[Math.min(z + 1, N) * (N + 1) + x];
+      const dx = (hr - hl) / (2 * cell);
+      const dz = (hu - hd) / (2 * cell);
+      const len = Math.hypot(-dx, 1, -dz);
+      normals[i * 3]     = -dx / len;
+      normals[i * 3 + 1] =  1 / len;
+      normals[i * 3 + 2] = -dz / len;
+    }
+  }
+
+  // -- Pass 3：按海拔 + 坡度调色 --
+  const colors = new Float32Array(positions.length);
+  for (let i = 0; i <= N * N; i++) {
+    const h = heights[i];
+    const slope = 1 - normals[i * 3 + 1];      // 法线越不朝上 => 越陡
+    let r, g, b;
+    if (h > 1.9) {                              // 雪线
+      const k = Math.min((h - 1.9) / 0.7, 1);
+      r = 0.72 + 0.20 * k; g = 0.74 + 0.22 * k; b = 0.78 + 0.20 * k;
+    } else if (h > 1.0) {                       // 高地岩石
+      r = 0.48; g = 0.45; b = 0.42;
+    } else {                                    // 草地
+      r = 0.22; g = 0.46; b = 0.20;
+    }
+    // 陡坡强制岩石色（坡度混合），雪也会挂在陡壁上不自然
+    const rockMix = Math.min(slope * 5.5, 1);
+    r = r + (0.42 - r) * rockMix;
+    g = g + (0.39 - g) * rockMix;
+    b = b + (0.36 - b) * rockMix;
+    colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+  }
+
+  // -- Pass 4：索引 --
+  const indices = new Uint32Array(N * N * 6);
+  let p = 0;
+  for (let z = 0; z < N; z++) {
+    for (let x = 0; x < N; x++) {
+      const a = z * (N + 1) + x, b = a + N + 1;
+      indices[p++] = a; indices[p++] = b; indices[p++] = a + 1;
+      indices[p++] = a + 1; indices[p++] = b; indices[p++] = b + 1;
+    }
+  }
+
+  return { positions, normals, colors, indices };
+}
+
+const terrain = buildTerrain();
+const uintExt = gl.getExtension('OES_element_index_uint');
+const IdxType = uintExt ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);   // 一次性几何：STATIC_DRAW
+  return b;
+}
+buf(gl.ARRAY_BUFFER, terrain.positions);
+const aPosLoc = gl.getAttribLocation(program, 'aPos');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, terrain.normals);
+const aNorLoc = gl.getAttribLocation(program, 'aNormal');
+gl.enableVertexAttribArray(aNorLoc);
+gl.vertexAttribPointer(aNorLoc, 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, terrain.colors);
+const aColLoc = gl.getAttribLocation(program, 'aColor');
+gl.enableVertexAttribArray(aColLoc);
+gl.vertexAttribPointer(aColLoc, 3, gl.FLOAT, false, 0, 0);
+const idxBuf = buf(gl.ELEMENT_ARRAY_BUFFER, terrain.indices);
+
+const uView = gl.getUniformLocation(program, 'uView');
+const uProj = gl.getUniformLocation(program, 'uProj');
+const uLight = gl.getUniformLocation(program, 'uLightDir');
+const uEye = gl.getUniformLocation(program, 'uEye');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+gl.clearColor(0.35, 0.48, 0.66, 1);   // 和雾色一致
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // 相机绕主峰缓慢环绕，俯仰角固定（距离要大于地形半径才能看全貌）
+  const eye = [Math.cos(t * 0.08) * 24, 12.5, Math.sin(t * 0.08) * 24];
+  const view = M4.lookAt(eye, [0, 0.5, 0], [0, 1, 0]);
+  const proj = M4.perspective(52 * Math.PI / 180, canvas.width / canvas.height, 0.1, 120);
+
+  gl.uniformMatrix4fv(uView, false, view);
+  gl.uniformMatrix4fv(uProj, false, proj);
+  gl.uniform3f(uLight, 0.45, 0.85, 0.3);
+  gl.uniform3fv(uEye, eye);
+
+  gl.drawElements(gl.TRIANGLES, terrain.indices.length, IdxType, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 地形的进阶话题：
+ *   LOD / 四叉树 —— 近处用细网格，远处粗网格（CDLOD、GeoMipMap）
+ *   分块 chunk + 视锥剔除 —— 大世界按块加载/卸载
+ *   法线贴图叠加 —— 细节碎石不加大三角数量（第 16 课技术）
+ *   水面 —— 单独一层半透明网格 + 法线扰动 + 菲涅尔（14/17 课技术合体）
+ *   高度采样函数 —— 让角色/粒子「站」在地形上：直接调用 h(x,z)
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

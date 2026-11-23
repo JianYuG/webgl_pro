@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>28B · 鼠标绘制：用 gl.POINTS 造一支画笔</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #101218; }
+  /* touch-action:none 很关键：阻止浏览器把触摸手势当成滚动/缩放，
+     pointermove 才能连续收到坐标 */
+  #glcanvas { position: absolute; inset: 0; width: 100%; height: 100%;
+              display: block; cursor: crosshair; touch-action: none; }
+
+  /* ---------------- 工具面板（DOM，不占 GPU） ---------------- */
+  #hud {
+    position: absolute; top: 16px; left: 16px; width: 232px;
+    background: rgba(18, 21, 30, 0.92); border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px; padding: 14px 16px; color: #dfe3ea;
+    font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+    backdrop-filter: blur(6px); user-select: none;
+  }
+  #hud h1 { font-size: 14px; letter-spacing: 1px; margin-bottom: 2px; }
+  #hud .sub { font-size: 11px; color: #8b93a5; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .label { font-size: 11px; color: #8b93a5; width: 40px; }
+
+  .swatch { width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+            border: 2px solid transparent; transition: transform .1s, border-color .1s; }
+  .swatch:hover { transform: scale(1.15); }
+  .swatch.active { border-color: #fff; transform: scale(1.15); }
+
+  .btn { flex: 1; padding: 6px 0; text-align: center; font-size: 12px;
+         background: rgba(255,255,255,0.07); color: #dfe3ea; border: 1px solid rgba(255,255,255,0.12);
+         border-radius: 7px; cursor: pointer; transition: background .12s; }
+  .btn:hover { background: rgba(255,255,255,0.14); }
+  .btn.active { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+
+  input[type=range] { flex: 1; accent-color: #2f6fed; }
+  #hint { margin-top: 12px; font-size: 11px; color: #6d7484; line-height: 1.7; }
+  #stats { margin-top: 8px; font-size: 11px; color: #52d273; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div id="hud">
+  <h1>WEBGL 画板</h1>
+  <div class="sub">28B · gl.POINTS 造一支画笔</div>
+
+  <div class="row" id="colors"></div>
+
+  <div class="row">
+    <span class="label">粗细</span>
+    <input type="range" id="size" min="4" max="60" value="18">
+    <span id="sizeVal" style="width:22px;font-size:11px;color:#8b93a5">18</span>
+  </div>
+
+  <div class="row">
+    <span class="label">笔刷</span>
+    <div class="btn active" id="modeSoft">软笔</div>
+    <div class="btn" id="modeNeon">霓虹</div>
+  </div>
+
+  <div class="row">
+    <div class="btn" id="undo">撤销 Ctrl+Z</div>
+    <div class="btn" id="clear">清空</div>
+  </div>
+
+  <div id="hint">
+    按住左键拖动作画 · 快速滑动笔迹变细<br>
+    [ / ] 调整粗细 · Ctrl+Z 撤销
+  </div>
+  <div id="stats"></div>
+</div>
+
+<script>
+/* ==================================================================
+ * 28B · 鼠标绘制 —— 把 gl.POINTS 用成一支真正的画笔
+ * ==================================================================
+ * 到这一课为止你学过的东西几乎全部派上用场：
+ *
+ *   02 课的 gl.POINTS + gl_PointCoord  → 圆形软边笔刷
+ *   04 课的交错缓冲区 (interleaved)     → 每个盖章点 8 个 float 一条
+ *   14 课的 alpha 混合                  → 软笔 SRC_ALPHA / 霓虹加色 ONE
+ *   05 课的「按需渲染」思想              → 画面不动就不浪费 GPU
+ *   08b 课的设备像素比处理              → 高分屏不模糊
+ *
+ * 【本课最重要的设计决策】画面不是「画上去就留在画布上」，
+ * 而是所有笔迹都记在一个大 Float32Array 里，每一帧从数据重画。
+ *
+ *   ┌ 累积式（往 framebuffer 上画，需要 preserveDrawingBuffer）
+ *   │   优点：每帧只画新增的点，性能好
+ *   │   致命伤：撤销/清屏/窗口变化都要「擦掉已画的像素」——擦不掉
+ *   └ 重画式（本课）：每帧把全部数据重新 draw
+ *       优点：撤销 = 数组回退几个元素；窗口变化 = 换个 uRes 重画
+ *       代价：数据量大时每帧上传多（本课用增量上传 bufferSubData 化解）
+ *
+ * 生产级绘画应用（如 Sketchpad 类产品）几乎都选重画式，
+ * 数据特别大时把笔迹 bake 到离屏纹理（FBO，见 12 课）分层缓存。
+ *
+ * 【笔刷为什么是「盖章点」而不是一条连续的线？】
+ * WebGL1 的 gl.LINES 宽度在多数平台上被锁死为 1 像素（规范如此，
+ * gl.lineWidth 大于 1 会被静默忽略）。想画粗线只有两条路：
+ *   a) 三角形条带展开成有宽度的四边形（处理自交/圆角很麻烦）
+ *   b) 沿路径按固定间距「盖章」点精灵 ← 本课选它，简单且效果好
+ * ================================================================== */
+
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { antialias: true });
+if (!gl) { document.getElementById('hint').textContent = '当前浏览器不支持 WebGL'; throw new Error('no webgl'); }
+
+/* ---------------- 着色器 ----------------
+ * 顶点：像素坐标 → 裁剪空间（Y 翻转，因为屏幕坐标向下增长）
+ * 片元：gl_PointCoord 是点精灵内部的 [0,1] 坐标（18 课讲过），
+ *       用 smoothstep 做出「中心实、边缘散」的软圆 */
+const VS_SRC = `
+  attribute vec2  aPos;    // 盖章位置（设备像素）
+  attribute float aSize;   // 笔刷直径（像素）
+  attribute float aMode;   // 0 = 软笔, 1 = 霓虹
+  attribute vec4  aColor;  // RGBA，各分量 0~1
+
+  uniform vec2 uRes;       // 画布像素尺寸
+  varying vec4  vColor;
+  varying float vMode;
+
+  void main() {
+    vec2 clip = (aPos / uRes * 2.0 - 1.0) * vec2(1.0, -1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);   // vec4(vec2, z, w) 一共 4 个参数
+
+    /* 点大小上限因 GPU 而异（规范只保证 1.0！），滑块最大 60 已够用，
+     * 但仍夹一下避免个别驱动悄悄截断 */
+    gl_PointSize = clamp(aSize, 1.0, 64.0);
+
+    vColor = aColor;
+    vMode  = aMode;
+  }
+`;
+
+const FS_SRC = `
+  precision mediump float;
+  varying vec4  vColor;
+  varying float vMode;
+
+  void main() {
+    vec2  d = gl_PointCoord * 2.0 - 1.0;   // [0,1] → [-1,1]，圆心为原点
+    float r = length(d);
+
+    float soft = smoothstep(1.0, 0.45, r);            // 软笔：边缘柔和衰减
+    float neon = smoothstep(1.0, 0.0, r)              // 霓虹：边缘全散
+               * smoothstep(0.0, 0.35, r);            // 但中心实心，避免中间镂空
+    float a = mix(soft, neon, vMode);
+
+    if (a < 0.004) discard;                  // 完全透明的片元直接丢弃，省混合
+    gl_FragColor = vec4(vColor.rgb, vColor.a * a);
+  }
+`;
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('shader: ' + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+function linkProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error('link: ' + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+const prog = linkProgram(VS_SRC, FS_SRC);
+gl.useProgram(prog);
+
+const A_POS   = gl.getAttribLocation(prog, 'aPos');
+const A_SIZE  = gl.getAttribLocation(prog, 'aSize');
+const A_MODE  = gl.getAttribLocation(prog, 'aMode');
+const A_COLOR = gl.getAttribLocation(prog, 'aColor');
+const U_RES   = gl.getUniformLocation(prog, 'uRes');
+
+[A_POS, A_SIZE, A_MODE, A_COLOR].forEach(loc => gl.enableVertexAttribArray(loc));
+
+/* ---------------- 笔迹数据 ----------------
+ * 交错布局（04 课）：每个盖章点 8 个 float
+ *   [x, y, size, mode, r, g, b, a]  → 步长 32 字节 */
+const FPV = 8;
+const BYTES = FPV * 4;
+const CAP = 120000;               // 每层最多盖章数（约 4MB，足够画很久）
+
+/* 两个「图层」对应两种混合模式。混在一个缓冲区里不行——
+ * blendFunc 是全局状态，没法按片元切换，只能按 draw 分组 */
+const layers = {
+  soft: { data: new Float32Array(CAP * FPV), count: 0, uploaded: 0, buf: gl.createBuffer() },
+  neon: { data: new Float32Array(CAP * FPV), count: 0, uploaded: 0, buf: gl.createBuffer() }
+};
+/* 【易错点】bufferData 只分配容量、不上传数据时，第二个参数传字节数。
+ * 没有 bufferData 分配过存储的缓冲区是 0 字节，对它 bufferSubData 会报
+ * INVALID_VALUE: buffer overflow —— 写入被静默丢弃，画布全空且只有一条警告 */
+for (const k in layers) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, layers[k].buf);
+  gl.bufferData(gl.ARRAY_BUFFER, layers[k].data.byteLength, gl.DYNAMIC_DRAW);
+}
+/* 撤销栈：每笔 { layer, start, count }，回退时把层计数退回去即可 */
+const strokes = [];
+
+/* ---------------- 笔刷状态 ---------------- */
+const brush = {
+  color: [0.30, 0.59, 0.99, 0.85],   // 默认蓝
+  size: 18,
+  mode: 'soft'
+};
+
+/* ---------------- 坐标与盖章 ---------------- */
+let dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);   // 08b 课：高分屏补偿
+  const w = Math.round(canvas.clientWidth  * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    dirty = true;
+    /* 注：窗口尺寸改变后，历史笔迹的像素坐标不变，
+     * 所以画布变大时旧笔迹位置不动（而不是跟着拉伸）——
+     * 这是「记像素坐标」的天然结果；想跟随缩放就改记 NDC 坐标 */
+  }
+}
+
+function pushStamp(layer, x, y, size, mode) {
+  if (layer.count >= CAP) return false;              // 满了就静默停笔
+  const o = layer.count * FPV, d = layer.data;
+  d[o] = x; d[o+1] = y;
+  d[o+2] = size; d[o+3] = mode;
+  d[o+4] = brush.color[0]; d[o+5] = brush.color[1];
+  d[o+6] = brush.color[2]; d[o+7] = brush.color[3];
+  layer.count++;
+  return true;
+}
+
+/* ---------------- 指针事件：收集盖章点 ---------------- */
+let drawing = false;
+let last = null;          // 上一个盖章位置（CSS 像素）
+let smSize = brush.size;  // 平滑后的笔刷尺寸（速度感应）
+
+function strokeTo(x, y) {
+  /* 关键：pointermove 事件不是逐像素触发的（高速时一次跳十几像素），
+   * 直接盖章会出现虚线断点。按「间距 ≈ 笔刷半径的 1/4」在两点间插值，
+   * 保证任何速度下笔迹连续 */
+  const layer = layers[brush.mode];
+  const dx = x - last.x, dy = y - last.y;
+  const dist = Math.hypot(dx, dy);
+  const spacing = Math.max(1.5, brush.size * 0.14);
+  const steps = Math.max(1, Math.ceil(dist / spacing));
+  for (let i = 1; i <= steps; i++) {
+    pushStamp(layer, (last.x + dx * i / steps) * dpr, (last.y + dy * i / steps) * dpr, smSize, brush.mode === 'neon' ? 1 : 0);
+  }
+  last = { x, y };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;                 // 只认左键
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);      // 拖出画布也继续收事件
+  drawing = true;
+  smSize = brush.size;
+  last = { x: e.offsetX, y: e.offsetY };
+  pushStamp(layers[brush.mode], e.offsetX * dpr, e.offsetY * dpr, brush.size, brush.mode === 'neon' ? 1 : 0);
+  strokes.push({ layer: brush.mode, start: layers[brush.mode].count - 1, count: 1 });
+  dirty = true;
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!drawing) return;
+  const x = e.offsetX, y = e.offsetY;
+
+  /* 速度感应笔宽：速度越快笔越细（模拟真实笔触的提笔）
+   * speed 单位 px/ms，普通拖动约 0.5~3，爆炸快拖 5+ */
+  const now = performance.now();
+  const dt = Math.max(1, now - lastT);
+  lastT = now;
+  const speed = Math.hypot(x - last.x, y - last.y) / dt;
+  const target = brush.size * Math.min(1.25, Math.max(0.35, 1.25 - speed * 0.05));
+  smSize += (target - smSize) * 0.3;          // 指数平滑，避免宽度抖动
+
+  strokeTo(x, y);
+  dirty = true;
+});
+
+let lastT = performance.now();
+
+function endStroke() {
+  if (!drawing) return;
+  drawing = false;
+  /* 修正撤销栈里这一笔的真实盖章数 */
+  const s = strokes[strokes.length - 1];
+  if (s) s.count = layers[s.layer].count - s.start;
+}
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+/* ---------------- 撤销 / 清空 ---------------- */
+function undo() {
+  const s = strokes.pop();
+  if (!s) return;
+  const layer = layers[s.layer];
+  layer.count = s.start;
+  layer.uploaded = 0;          // 数据回退了，下次渲染从 0 增量重传（缓冲区容量不变，不会溢出）
+  dirty = true;
+}
+function clearAll() {
+  strokes.length = 0;
+  for (const k in layers) { layers[k].count = 0; layers[k].uploaded = 0; }
+  dirty = true;
+}
+
+/* ---------------- 工具面板 ---------------- */
+const PALETTE = [
+  ['#f2f4f8', '白'], ['#ff5d5d', '红'], ['#ff9f43', '橙'], ['#ffd93d', '黄'],
+  ['#6bcb77', '绿'], ['#4d96ff', '蓝'], ['#b58cff', '紫'], ['#2ee6d6', '青']
+];
+const colorsEl = document.getElementById('colors');
+PALETTE.forEach(([hex], i) => {
+  const b = document.createElement('div');
+  b.className = 'swatch' + (i === 5 ? ' active' : '');
+  b.style.background = hex;
+  b.title = hex;
+  b.onclick = () => {
+    brush.color = [
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255,
+      brush.mode === 'neon' ? 0.55 : 0.85
+    ];
+    colorsEl.querySelectorAll('.swatch').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    dirty = true;
+  };
+  colorsEl.appendChild(b);
+});
+
+const sizeEl = document.getElementById('size');
+const sizeVal = document.getElementById('sizeVal');
+sizeEl.oninput = () => { brush.size = +sizeEl.value; sizeVal.textContent = sizeEl.value; };
+
+function setMode(m) {
+  brush.mode = m;
+  document.getElementById('modeSoft').classList.toggle('active', m === 'soft');
+  document.getElementById('modeNeon').classList.toggle('active', m === 'neon');
+}
+document.getElementById('modeSoft').onclick = () => setMode('soft');
+document.getElementById('modeNeon').onclick = () => setMode('neon');
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = clearAll;
+
+window.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+  if (e.key === '[') { sizeEl.value = Math.max(4, brush.size - 4); sizeEl.oninput(); }
+  if (e.key === ']') { sizeEl.value = Math.min(60, brush.size + 4); sizeEl.oninput(); }
+});
+
+/* ---------------- 渲染（按需渲染：不脏不动 GPU） ---------------- */
+let dirty = true;
+
+function bindLayer(layer) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, layer.buf);
+  if (layer.count > layer.uploaded) {
+    /* 增量上传：只把新增的盖章点交给 GPU（缓冲区已在初始化时按
+     * CAP 预分配好容量，所以无论从哪个偏移写入都不会溢出）。
+     * 撤销后 uploaded 归 0，这里自然变成「从 0 重传全部存活数据」，
+     * 比 bufferData 整段重建更稳 —— bufferData 传 TypedArray 会把
+     * 缓冲区缩容到数据大小，之后新笔迹再 bufferSubData 又会溢出 */
+    gl.bufferSubData(gl.ARRAY_BUFFER, layer.uploaded * BYTES,
+                     layer.data.subarray(layer.uploaded * FPV, layer.count * FPV));
+    layer.uploaded = layer.count;
+  }
+
+  /* 交错缓冲区的 4 个 attribute 全指向同一块 VBO，用 stride/offset 区分 */
+  gl.vertexAttribPointer(A_POS,   2, gl.FLOAT, false, BYTES,  0);
+  gl.vertexAttribPointer(A_SIZE,  1, gl.FLOAT, false, BYTES,  8);
+  gl.vertexAttribPointer(A_MODE,  1, gl.FLOAT, false, BYTES, 12);
+  gl.vertexAttribPointer(A_COLOR, 4, gl.FLOAT, false, BYTES, 16);
+}
+
+const statsEl = document.getElementById('stats');
+function render() {
+  if (!dirty) return;
+  dirty = false;
+
+  /* 关键：uRes 必须每帧上传。GLSL 的 uniform 默认值是 vec2(0,0)，
+   * 忘了上传的话 aPos / uRes = 除以零 → gl_Position 全是 NaN
+   * → GPU 静默丢弃所有顶点 → 画布空白且控制台无任何报错 */
+  gl.uniform2f(U_RES, canvas.width, canvas.height);
+
+  gl.clearColor(0.063, 0.071, 0.094, 1);      // 深蓝灰画布底色
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.disable(gl.DEPTH_TEST);                  // 纯 2D 叠加，不需要深度
+
+  /* 软笔图层：普通 alpha 混合（14 课）
+   * 霓虹图层：加色混合（18 课火焰粒子同款），重叠处越画越亮 */
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  bindLayer(layers.soft);
+  gl.drawArrays(gl.POINTS, 0, layers.soft.count);
+
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  bindLayer(layers.neon);
+  gl.drawArrays(gl.POINTS, 0, layers.neon.count);
+
+  statsEl.textContent = `stamps ${layers.soft.count + layers.neon.count} · strokes ${strokes.length} · 2 draws`;
+}
+
+/* ---------------- 主循环 ----------------
+ * 画板类应用不需要 60fps 空转：只有 dirty 时才真正画。
+ * rAF 仍在跑（检查 dirty 的成本可忽略），但 GPU 大部分时间在休息 */
+window.addEventListener('resize', resize);
+resize();
+
+function frame() {
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

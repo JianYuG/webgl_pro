@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>28 · 动态构建：点 → 线 → 面</title>
+<!--
+  ============================================================
+  第 28 课：同一份几何数据，三种绘制模式，分成三个阶段「长」出来
+  ------------------------------------------------------------
+  画面流程（8 秒一轮循环）：
+    阶段 1  顶点按顺序逐个亮起          → gl.POINTS
+    阶段 2  相邻顶点之间长出连线        → gl.LINES
+    阶段 3  三角形从线框中填充出来      → gl.TRIANGLES
+
+  本课新知识点：
+    1. 三种基本图元：POINTS / LINES / TRIANGLES
+       —— 同一批顶点数据，换个模式就是完全不同的画面
+    2. 「生长动画」的实现技巧：
+       给每个顶点一个 aOrder（0~1 的出现顺序），
+       顶点着色器里 aOrder > uProgress 的顶点直接移到裁剪空间外，
+       于是 GPU 自己的裁剪功能免费帮你切出"半个三角形"。
+    3. 顶点着色器里的 uniform 是「每次绘制可改」的量：
+       同一帧内画点/线/面时分别传不同的 uProgress。
+    4. gl.POINTS 的点精灵：gl_PointSize + gl_PointCoord 画圆点。
+    5. 线框叠加的 z-fighting：gl.polygonOffset 把面推远一点，
+       让线稳稳地浮在面上（对 LINES 本身无效，只对多边形生效）。
+    6. 索引缓冲复用：面用三角形索引，线用「去重后的边」索引。
+
+  快捷键：空格 播放/暂停 · 1/2/3 跳到点/线/面阶段 · R 重播
+  URL 参数：#points / #lines / #faces 直接定格在某阶段（方便截图）
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #090c12; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+
+  .hud {
+    position: fixed; left: 18px; top: 18px; width: 340px;
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.72);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 4px; font-weight: 600; }
+  .hud p { font-size: 12px; color: #8b98a8; }
+
+  .phases { display: flex; gap: 6px; margin: 11px 0 8px; }
+  .ph {
+    flex: 1; text-align: center; padding: 6px 2px; border-radius: 7px;
+    font: 500 11px/1.35 ui-monospace, Consolas, monospace;
+    color: #7f8c9d; border: 1px solid rgba(255,255,255,.08);
+    background: rgba(255,255,255,.03); transition: all .2s ease;
+  }
+  .ph.on { color: #0b0e14; background: #58a6ff; border-color: #58a6ff; font-weight: 700; }
+  .ph.on.lines { background: #7ee787; border-color: #7ee787; }
+  .ph.on.faces { background: #bc8cff; border-color: #bc8cff; }
+
+  .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0%; background: #58a6ff; transition: background .2s; }
+
+  .stats {
+    margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10);
+    font: 500 11px/1.6 ui-monospace, Consolas, monospace; color: #7f8c9d;
+  }
+  .stats b { color: #ffa657; font-weight: 600; }
+
+  .panel {
+    position: fixed; right: 18px; top: 18px; width: 214px;
+    padding: 13px 14px; border-radius: 12px;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.76);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    font-size: 12.5px;
+  }
+  .panel h2 { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #7ee787; margin-bottom: 9px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .btns button {
+    flex: 1 1 auto; cursor: pointer; font: 500 12px/1.4 inherit; color: #e6edf3;
+    background: #1a2433; border: 1px solid rgba(255,255,255,.14);
+    border-radius: 7px; padding: 6px 9px;
+  }
+  .btns button:hover { background: #223046; border-color: rgba(88,166,255,.5); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; color: #98a4b3; }
+  .row input[type=range] { flex: 1; max-width: 110px; accent-color: #58a6ff; }
+  .row .val { font: 500 11px/1 ui-monospace, Consolas, monospace; color: #ffa657; width: 26px; text-align: right; }
+  .keys { margin-top: 11px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font: 500 11px/1.7 ui-monospace, Consolas, monospace; color: #6f7c8c; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 28</div>
+  <h1>动态构建：点 → 线 → 面</h1>
+  <p>同一份顶点数据，三遍不同画法：先亮起顶点，再连成线框，最后由三角形填满表面。</p>
+  <div class="phases">
+    <span class="ph on" id="ph0">① 点 POINTS</span>
+    <span class="ph" id="ph1">② 线 LINES</span>
+    <span class="ph" id="ph2">③ 面 TRIANGLES</span>
+  </div>
+  <div class="bar"><i id="bar"></i></div>
+  <div class="stats" id="stats"></div>
+</div>
+
+<div class="panel">
+  <h2>PLAYBACK</h2>
+  <div class="btns">
+    <button id="playBtn">暂停</button>
+    <button id="replayBtn">重播</button>
+  </div>
+  <div class="btns" style="margin-top:6px">
+    <button data-phase="0">看点</button>
+    <button data-phase="1">看线</button>
+    <button data-phase="2">看面</button>
+  </div>
+  <div class="row"><label>速度</label><input id="speed" type="range" min="0.3" max="2.5" step="0.1" value="1"><span class="val" id="speedVal">1×</span></div>
+  <div class="keys">空格 播放/暂停<br>1 / 2 / 3 跳阶段<br>R 重播</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（同前面各课）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  rotateZ(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+// 模型只有旋转（无非等比缩放），法线直接用 mat3(model) 即可（详见第 9 课）
+function mat3FromMat4(m) {
+  return new Float32Array([m[0],m[1],m[2], m[4],m[5],m[6], m[8],m[9],m[10]]);
+}
+
+/* ==================================================================
+ * 几何：环面纽结（Torus Knot）—— 一条绕着环面打结的管子
+ * ------------------------------------------------------------------
+ * 它足够"立体"，点/线/面三个阶段的观感差别最明显。
+ * 生成方式：沿曲线取样 → 每个取样点建一个正交基 → 绕圈画管。
+ * 顶点自带解析法线（不需要差分），还带一个 aOrder 表示出现顺序。
+ * ================================================================== */
+const PI2 = Math.PI * 2;
+const P = 2, Q = 3;          // 纽结参数 (2,3) 是最经典的一类
+const PATH = 240;            // 沿曲线的分段数
+const TUBE = 24;             // 管子截面的边数
+const TUBE_R = 0.30;         // 管子半径
+const SCALE = 0.62;          // 整体缩放，塞进视野
+
+const sub3  = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const cross3 = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const dot3  = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const norm3 = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+
+function knotPoint(u) {           // u ∈ [0,1) → 曲线上的点
+  const t = u * PI2;
+  const r = 2 + Math.cos(Q * t);
+  return [r * Math.cos(P * t), r * Math.sin(P * t), -Math.sin(Q * t)];
+}
+
+function buildKnot() {
+  const verts = [];               // 交错布局：[px,py,pz, nx,ny,nz, order]
+  for (let i = 0; i < PATH; i++) {
+    const u = i / PATH;
+    const h = 1e-3;
+    const T = norm3(sub3(knotPoint(u + h), knotPoint(u - h)));   // 切线
+    let up = [0, 0, 1];
+    if (Math.abs(dot3(T, up)) > 0.95) up = [0, 1, 0];            // 避开退化
+    const N = norm3(cross3(T, up));                              // 法向
+    const B = cross3(T, N);                                      // 副法向
+    const C = knotPoint(u);
+    for (let j = 0; j < TUBE; j++) {
+      const th = j / TUBE * PI2;
+      const cs = Math.cos(th), sn = Math.sin(th);
+      const dir = [
+        N[0]*cs + B[0]*sn,
+        N[1]*cs + B[1]*sn,
+        N[2]*cs + B[2]*sn
+      ];
+      // 出现顺序：沿曲线推进（同一截面的点同时出现，边界像一圈刀口）
+      verts.push(
+        (C[0] + TUBE_R*dir[0]) * SCALE,
+        (C[1] + TUBE_R*dir[1]) * SCALE,
+        (C[2] + TUBE_R*dir[2]) * SCALE,
+        dir[0], dir[1], dir[2],
+        u
+      );
+    }
+  }
+
+  const at = (i, j) => (i % PATH) * TUBE + (j % TUBE);
+
+  // --- 三角形索引 ---
+  // 绕序很重要：本课的管子用 (a,c,b) / (c,d,b) 才是「从外面看逆时针」。
+  // 写成直觉的 (a,b,c) 会让 5760 个三角形全部朝向内部，开背面剔除后整根管子消失。
+  const triIdx = [];
+  for (let i = 0; i < PATH; i++) {
+    for (let j = 0; j < TUBE; j++) {
+      const a = at(i, j), b = at(i + 1, j), c = at(i, j + 1), d = at(i + 1, j + 1);
+      triIdx.push(a, c, b, c, d, b);
+    }
+  }
+
+  // --- 线的索引：把三角形的边去重（否则每条内部边会画两遍） ---
+  const seen = new Set();
+  const lineIdx = [];
+  for (let k = 0; k < triIdx.length; k += 3) {
+    const t = [triIdx[k], triIdx[k+1], triIdx[k+2]];
+    for (let e = 0; e < 3; e++) {
+      const v0 = t[e], v1 = t[(e + 1) % 3];
+      const key = v0 < v1 ? v0 * 65536 + v1 : v1 * 65536 + v0;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      lineIdx.push(v0, v1);
+    }
+  }
+
+  return {
+    data: new Float32Array(verts),
+    triIdx: new Uint16Array(triIdx),
+    lineIdx: new Uint16Array(lineIdx),
+    vcount: PATH * TUBE,
+    triCount: triIdx.length / 3,
+    edgeCount: lineIdx.length / 2
+  };
+}
+
+const knot = buildKnot();
+
+/* ==================================================================
+ * 着色器 1：网格（线 / 面共用）—— 光照 + 生长裁剪
+ * ================================================================== */
+const MESH_VS = `
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  attribute float aOrder;        // 0~1：这个顶点在「生长序列」中的位置
+
+  uniform mat4 uMvp;
+  uniform mat3 uNormalMat;
+  uniform mat4 uModel;
+  uniform float uProgress;       // 当前已经长到哪儿了
+
+  varying vec3 vNormal;
+  varying vec3 vWorld;
+  varying float vOrder;
+
+  void main() {
+    vOrder  = aOrder;
+    vNormal = normalize(uNormalMat * aNormal);
+    vec4 wp = uModel * vec4(aPos, 1.0);
+    vWorld  = wp.xyz;
+
+    vec4 clip = uMvp * vec4(aPos, 1.0);
+
+    // 还没长到的顶点：w=1、xy=2 → 落在 NDC 的 [-1,1] 之外，被 GPU 裁掉。
+    // 妙处在于三角形「一半在内一半在外」时，硬件会帮你切出斜边，
+    // 于是看起来就是表面被刀口一点点推开 —— 不需要 CPU 端做任何事。
+    if (aOrder > uProgress) clip = vec4(2.0, 2.0, 2.0, 1.0);
+
+    gl_Position = clip;
+  }
+`;
+
+const MESH_FS = `
+  precision mediump float;
+
+  varying vec3 vNormal;
+  varying vec3 vWorld;
+  varying float vOrder;
+
+  uniform vec3 uLightDir;   // 指向光源的方向
+  uniform vec3 uCamPos;
+  uniform float uIsLine;    // 1 = 画线（暗部要额外提亮，否则看不见）
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uLightDir);
+    vec3 V = normalize(uCamPos - vWorld);
+    vec3 H = normalize(L + V);
+
+    // 基色随出现顺序从青蓝渐变到紫 —— 让「生长顺序」肉眼可读
+    vec3 base = mix(vec3(0.16, 0.60, 0.95), vec3(0.62, 0.36, 1.00), vOrder);
+
+    float diff = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), 48.0);
+    float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+    vec3 col = base * (0.22 + 0.85 * diff) + vec3(1.0) * spec * 0.5 + base * rim * 0.8;
+    col += vec3(0.10, 0.16, 0.22) * uIsLine;   // 线是细的，补一点底光
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+/* ==================================================================
+ * 着色器 2：点精灵
+ * ================================================================== */
+const POINT_VS = `
+  attribute vec3 aPos;
+  attribute float aOrder;
+
+  uniform mat4 uMvp;
+  uniform float uProgress;
+  uniform float uSize;
+
+  varying float vOrder;
+  varying float vPop;      // 刚出现的瞬间 = 1，随后迅速衰减
+
+  void main() {
+    vOrder = aOrder;
+
+    float visible = step(aOrder, uProgress);      // 0 或 1
+    vec4 clip = uMvp * vec4(aPos, 1.0);
+    if (visible < 0.5) clip = vec4(2.0, 2.0, 2.0, 1.0);
+
+    vPop = exp(-max(uProgress - aOrder, 0.0) * 30.0) * visible;
+
+    gl_Position  = clip;
+    gl_PointSize = uSize * visible * (1.0 + vPop * 1.1);   // 亮起瞬间稍大
+  }
+`;
+
+const POINT_FS = `
+  precision mediump float;
+
+  varying float vOrder;
+  varying float vPop;
+
+  void main() {
+    // gl_PointCoord 是点内部的 0~1 坐标，用它把方形点裁成圆形
+    vec2 d = gl_PointCoord - vec2(0.5);
+    float r = length(d);
+    if (r > 0.5) discard;
+
+    float alpha = smoothstep(0.5, 0.10, r);
+    vec3 base = mix(vec3(0.40, 0.95, 1.0), vec3(0.78, 0.48, 1.0), vOrder);
+
+    gl_FragColor = vec4(base + vec3(1.0) * vPop * 1.4, alpha);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const meshProg  = createProgram(MESH_VS,  MESH_FS);
+const pointProg = createProgram(POINT_VS, POINT_FS);
+
+/* ---- 缓冲区：一个 VBO 装所有顶点，两个 IBO 分别装面和线 ---- */
+const STRIDE = 7 * 4;                 // 3 pos + 3 normal + 1 order
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, knot.data, gl.STATIC_DRAW);
+
+const triIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, triIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, knot.triIdx, gl.STATIC_DRAW);
+
+const lineIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, knot.lineIdx, gl.STATIC_DRAW);
+
+/* ---- 取 attribute / uniform 位置 ---- */
+const meshA = {
+  pos:    gl.getAttribLocation(meshProg, 'aPos'),
+  normal: gl.getAttribLocation(meshProg, 'aNormal'),
+  order:  gl.getAttribLocation(meshProg, 'aOrder')
+};
+const meshU = {
+  mvp:       gl.getUniformLocation(meshProg, 'uMvp'),
+  model:     gl.getUniformLocation(meshProg, 'uModel'),
+  normalMat: gl.getUniformLocation(meshProg, 'uNormalMat'),
+  progress:  gl.getUniformLocation(meshProg, 'uProgress'),
+  lightDir:  gl.getUniformLocation(meshProg, 'uLightDir'),
+  camPos:    gl.getUniformLocation(meshProg, 'uCamPos'),
+  isLine:    gl.getUniformLocation(meshProg, 'uIsLine')
+};
+const pointA = {
+  pos:   gl.getAttribLocation(pointProg, 'aPos'),
+  order: gl.getAttribLocation(pointProg, 'aOrder')
+};
+const pointU = {
+  mvp:      gl.getUniformLocation(pointProg, 'uMvp'),
+  progress: gl.getUniformLocation(pointProg, 'uProgress'),
+  size:     gl.getUniformLocation(pointProg, 'uSize')
+};
+
+/* ---- 每个 program 用自己的 attribute 布局，绘制前都要重设一遍 ---- */
+function bindMeshAttribs() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.enableVertexAttribArray(meshA.pos);
+  gl.vertexAttribPointer(meshA.pos, 3, gl.FLOAT, false, STRIDE, 0);
+  gl.enableVertexAttribArray(meshA.normal);
+  gl.vertexAttribPointer(meshA.normal, 3, gl.FLOAT, false, STRIDE, 12);
+  gl.enableVertexAttribArray(meshA.order);
+  gl.vertexAttribPointer(meshA.order, 1, gl.FLOAT, false, STRIDE, 24);
+}
+function bindPointAttribs() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.enableVertexAttribArray(pointA.pos);
+  gl.vertexAttribPointer(pointA.pos, 3, gl.FLOAT, false, STRIDE, 0);
+  gl.enableVertexAttribArray(pointA.order);
+  gl.vertexAttribPointer(pointA.order, 1, gl.FLOAT, false, STRIDE, 24);
+}
+
+/* ==================================================================
+ * 时间轴：8 秒一轮
+ *    0 ~ 2.6s  点阶段
+ *  2.6 ~ 5.2s  线阶段
+ *  5.2 ~ 7.8s  面阶段
+ *  7.8 ~ 9.0s  完整形态停留
+ * ================================================================== */
+const PHASE_DUR = 2.6;
+const HOLD = 1.2;
+const TOTAL = PHASE_DUR * 3 + HOLD;
+
+let elapsed = 0;
+let playing = true;
+let speed = 1;
+
+function timeline() {
+  const t = elapsed % TOTAL;
+  let phase, prog;
+  if (t < PHASE_DUR) {
+    phase = 0; prog = t / PHASE_DUR;
+  } else if (t < PHASE_DUR * 2) {
+    phase = 1; prog = (t - PHASE_DUR) / PHASE_DUR;
+  } else if (t < PHASE_DUR * 3) {
+    phase = 2; prog = (t - PHASE_DUR * 2) / PHASE_DUR;
+  } else {
+    phase = 2; prog = 1;                      // 停留：完整形体
+  }
+  return { phase, prog: Math.min(prog, 1) };
+}
+
+/* ==================================================================
+ * UI
+ * ================================================================== */
+const phEls = [document.getElementById('ph0'), document.getElementById('ph1'), document.getElementById('ph2')];
+const barEl = document.getElementById('bar');
+const statsEl = document.getElementById('stats');
+const playBtn = document.getElementById('playBtn');
+
+statsEl.innerHTML =
+  `顶点 <b>${knot.vcount}</b> · 边 <b>${knot.edgeCount}</b> · 三角形 <b>${knot.triCount}</b><br>` +
+  `draw calls / 帧：点 1 + 线 1 + 面 1`;
+
+function setPlaying(v) {
+  playing = v;
+  playBtn.textContent = v ? '暂停' : '播放';
+}
+function jumpTo(phaseIdx) {
+  // 跳到该阶段的 92% 处：几乎长满，形态完整
+  elapsed = phaseIdx * PHASE_DUR + PHASE_DUR * 0.92;
+  setPlaying(false);
+}
+
+playBtn.addEventListener('click', () => setPlaying(!playing));
+document.getElementById('replayBtn').addEventListener('click', () => {
+  elapsed = 0; setPlaying(true);
+});
+document.querySelectorAll('.panel button[data-phase]').forEach((btn) => {
+  btn.addEventListener('click', () => jumpTo(+btn.dataset.phase));
+});
+document.getElementById('speed').addEventListener('input', (e) => {
+  speed = +e.target.value;
+  document.getElementById('speedVal').textContent = speed.toFixed(1).replace('.0', '') + '×';
+});
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  if (e.key === '1') jumpTo(0);
+  if (e.key === '2') jumpTo(1);
+  if (e.key === '3') jumpTo(2);
+  if (e.key === 'r' || e.key === 'R') { elapsed = 0; setPlaying(true); }
+});
+
+// URL 定格：方便截图核对某一阶段（#points / #lines / #faces）
+(function applyHash() {
+  const h = location.hash.replace('#', '');
+  const map = { points: 0, lines: 1, faces: 2 };
+  if (h in map) jumpTo(map[h]);
+  else if (h === 'hold') { elapsed = PHASE_DUR * 3 + 0.4; setPlaying(false); }
+})();
+
+/* ==================================================================
+ * 渲染
+ * ================================================================== */
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);      // 管子是闭合的，背面剔除能省一半像素
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+const CAM = { eye: [0, 0, 6.4], target: [0, 0, 0] };
+const LIGHT = [0.55, 0.75, 0.6];
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  clock += dt;
+  if (playing) elapsed += dt * speed;
+
+  const { phase, prog } = timeline();
+
+  resize();
+  gl.clearColor(0.035, 0.043, 0.062, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(50 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt(CAM.eye, CAM.target, [0, 1, 0]);
+  // 模型缓慢自转 + 轻微俯仰，保证三个阶段都能看清立体感
+  const model = M4.chain(
+    M4.rotateY(clock * 0.35),
+    M4.rotateX(0.35 + Math.sin(clock * 0.5) * 0.12),
+    M4.rotateZ(clock * 0.12)
+  );
+  const mvp = M4.chain(proj, view, model);
+
+  /* ---------- 阶段 3：面 ---------- */
+  if (phase >= 2) {
+    gl.useProgram(meshProg);
+    bindMeshAttribs();
+    gl.uniformMatrix4fv(meshU.mvp, false, mvp);
+    gl.uniformMatrix4fv(meshU.model, false, model);
+    gl.uniformMatrix3fv(meshU.normalMat, false, mat3FromMat4(model));
+    gl.uniform3fv(meshU.lightDir, LIGHT);
+    gl.uniform3fv(meshU.camPos, CAM.eye);
+    gl.uniform1f(meshU.isLine, 0);
+    gl.uniform1f(meshU.progress, prog);
+
+    // 关键：把面在深度上「往后推」一点，后面画的线框才不会被 z-fighting 吃掉。
+    // polygonOffset 只对多边形（三角形）生效，对 LINES 无效 —— 所以要设在面上。
+    gl.enable(gl.POLYGON_OFFSET_FILL);
+    gl.polygonOffset(1.5, 4.0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, triIbo);
+    gl.drawElements(gl.TRIANGLES, knot.triIdx.length, gl.UNSIGNED_SHORT, 0);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+  }
+
+  /* ---------- 阶段 2：线 ---------- */
+  if (phase >= 1) {
+    gl.useProgram(meshProg);
+    bindMeshAttribs();
+    gl.uniformMatrix4fv(meshU.mvp, false, mvp);
+    gl.uniformMatrix4fv(meshU.model, false, model);
+    gl.uniformMatrix3fv(meshU.normalMat, false, mat3FromMat4(model));
+    gl.uniform3fv(meshU.lightDir, LIGHT);
+    gl.uniform3fv(meshU.camPos, CAM.eye);
+    gl.uniform1f(meshU.isLine, 1);
+    // 面阶段时线已经全部长完（1.0）；线阶段才按 prog 生长
+    gl.uniform1f(meshU.progress, phase === 1 ? prog : 1.0);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIbo);
+    gl.drawElements(gl.LINES, knot.lineIdx.length, gl.UNSIGNED_SHORT, 0);
+  }
+
+  /* ---------- 阶段 1：点 ---------- */
+  if (phase < 2) {                       // 面出现后点就功成身退（否则和面 z-fighting）
+    gl.useProgram(pointProg);
+    bindPointAttribs();
+    gl.uniformMatrix4fv(pointU.mvp, false, mvp);
+    gl.uniform1f(pointU.progress, phase === 0 ? prog : 1.0);
+    gl.uniform1f(pointU.size, 3.2 * (canvas.height / 760));   // 按分辨率补偿，别在高分屏上变成芝麻
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);                 // 点半透明，别写深度，避免互相遮挡出黑边
+    gl.drawArrays(gl.POINTS, 0, knot.vcount);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+  }
+
+  /* ---------- HUD ---------- */
+  phEls.forEach((el, i) => {
+    el.classList.toggle('on', i === phase);
+    el.classList.toggle('lines', i === 1);
+    el.classList.toggle('faces', i === 2);
+  });
+  barEl.style.width = Math.round(prog * 100) + '%';
+  barEl.style.background = phase === 0 ? '#58a6ff' : phase === 1 ? '#7ee787' : '#bc8cff';
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 为什么三个阶段共用一套顶点数据？
+ *   GPU 里存的只是「顶点数组 + 索引」。点/线/面不是三种模型，
+ *   而是同一个模型的三种解释方式：
+ *     POINTS     每 1 个顶点 → 1 个像素方块（点精灵）
+ *     LINES      每 2 个索引 → 1 条线段
+ *     TRIANGLES  每 3 个索引 → 1 个三角形
+ *   所以「切换画法」的成本几乎为零，只是换个 draw 调用。
+ *
+ * 生长动画的本质也是「裁剪」：
+ *   顶点被移出 NDC（|x|>1 或 |y|>1 或 |z|>1）后，图元会被硬件裁剪；
+ *   线段一端在内、一端在外 → 得到半条线；
+ *   三角形的三个顶点部分在外 → 得到带斜边的三角块。
+ *   这就是为什么不需要在 CPU 上重建几何，也能做出"被刀口推开"的效果。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

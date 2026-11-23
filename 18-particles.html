@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>18 · 粒子系统：点精灵与加色混合</title>
+<!--
+  ============================================================
+  第 18 课：粒子系统（Particle System）
+  ------------------------------------------------------------
+  粒子是「大量独立小元素」的总称：火焰、烟、雨、星星、碎屑。
+  WebGL 里最便宜的粒子载体是 gl.POINTS：
+    一个顶点 = 一个粒子，GPU 自动把它光栅化成方形点精灵，
+    片元里用 gl_PointCoord 把方点抠成软圆。
+
+  本课新知识点：
+    1. gl.POINTS + gl_PointSize + gl_PointCoord 的点精灵工作流
+    2. 点大小随距离衰减（透视除法近似）
+    3. DYNAMIC_DRAW + bufferSubData：每帧只上传「变化的那部分」数据
+    4. 加色混合 blendFunc(SRC_ALPHA, ONE)：火焰/光效为什么越叠越亮
+    5. 生命周期：出生 -> 演化 -> 死亡重生的环形缓冲写法
+
+  性能提示：上万粒子后应改成「GPU 模拟」（纹理存状态 / transform feedback），
+  第 25、26 课会接触相关技术。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 18</div>
+  <h1>粒子系统：点精灵与加色混合</h1>
+  <p>4000 个粒子的喷泉：CPU 模拟物理，每帧只上传活着的粒子，加色混合让重叠处越来越亮。</p>
+  <div class="tip">一个顶点 = 一个粒子 · gl_PointCoord 把方点抠成软圆</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: false });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 粒子着色器
+ * ----------------------------------------------------------------
+ * 每个粒子的顶点属性（交错存放）：
+ *   aPos   vec3   当前位置
+ *   aSize  float  世界尺寸
+ *   aColor vec3   颜色（随生命周期由 CPU 算好）
+ *   aAlpha float  透明度（淡入淡出也由 CPU 算好）
+ * ================================================================== */
+const program = createProgram(`
+  attribute vec3  aPos;
+  attribute float aSize;
+  attribute vec3  aColor;
+  attribute float aAlpha;
+
+  uniform mat4 uView;
+  uniform mat4 uProj;
+  uniform float uDpr;          // 点大小是「物理像素」，DPR 缩放必须手动算
+
+  varying vec3  vColor;
+  varying float vAlpha;
+
+  void main() {
+    vec4 viewPos = uView * vec4(aPos, 1.0);
+    gl_Position = uProj * viewPos;
+
+    /* 点大小的透视衰减：
+     * 世界尺寸 -> 屏幕像素的换算依赖投影矩阵的 y 缩放因子 proj[5]
+     * 和视口高度的一半；除以视深 -viewPos.z 完成透视收缩。
+     * gl_PointSize 有上限（通常 ≥ 1024），超大粒子会撑不满。 */
+    gl_PointSize = aSize * uProj[1][1] * uDpr * 0.5 * 760.0 / -viewPos.z;
+
+    vColor = aColor;
+    vAlpha = aAlpha;
+  }
+`, `
+  precision mediump float;
+
+  varying vec3  vColor;
+  varying float vAlpha;
+
+  void main() {
+    /* gl_PointCoord：当前点精灵内部的坐标，(0,0) 左上 -> (1,1) 右下。
+     * 用它到中心的距离做一个软圆 —— 这就是「发光光斑」的全部秘密。
+     * 硬边贴图粒子、SDF 圆、纹理粒子都是在这个坐标上做文章。 */
+    vec2 p = gl_PointCoord * 2.0 - 1.0;
+    float d = dot(p, p);
+    if (d > 1.0) discard;                       // 方点四角抠掉
+    float falloff = pow(1.0 - d, 2.0);          // 中心亮、边缘软
+
+    gl_FragColor = vec4(vColor * falloff, vAlpha * falloff);
+  }
+`);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 粒子池（环形缓冲）
+ * ----------------------------------------------------------------
+ * 结构化数组 vs 交错 Float32Array：这里用「每粒子一个小对象」保持可读，
+ * 渲染数据统一压进一个交错的 Float32Array 上传。真实的引擎会
+ * 全程用扁平数组（SoA 或 AoS）避免 GC 抖动。
+ * ================================================================== */
+const MAX_PARTICLES = 4000;
+const FLOATS_PER_PARTICLE = 10;    // x,y,z, size, r,g,b, alpha, (2 填充对齐可省)
+const gpuData = new Float32Array(MAX_PARTICLES * FLOATS_PER_PARTICLE);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+// 关键：粒子数据每帧都变，用 DYNAMIC_DRAW 提示驱动放进对 CPU 友好的显存
+gl.bufferData(gl.ARRAY_BUFFER, gpuData.byteLength, gl.DYNAMIC_DRAW);
+
+const stride = FLOATS_PER_PARTICLE * 4;
+const aPosLoc   = gl.getAttribLocation(program, 'aPos');
+const aSizeLoc  = gl.getAttribLocation(program, 'aSize');
+const aColorLoc = gl.getAttribLocation(program, 'aColor');
+const aAlphaLoc = gl.getAttribLocation(program, 'aAlpha');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, stride, 0);
+gl.enableVertexAttribArray(aSizeLoc);
+gl.vertexAttribPointer(aSizeLoc, 1, gl.FLOAT, false, stride, 12);
+gl.enableVertexAttribArray(aColorLoc);
+gl.vertexAttribPointer(aColorLoc, 3, gl.FLOAT, false, stride, 16);
+gl.enableVertexAttribArray(aAlphaLoc);
+gl.vertexAttribPointer(aAlphaLoc, 1, gl.FLOAT, false, stride, 28);
+
+const uView = gl.getUniformLocation(program, 'uView');
+const uProj = gl.getUniformLocation(program, 'uProj');
+const uDpr  = gl.getUniformLocation(program, 'uDpr');
+
+/* ---------------- 粒子状态与生成器 ---------------- */
+const particles = [];
+for (let i = 0; i < MAX_PARTICLES; i++) particles.push({ life: -1 });
+
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// 喷泉口：从原点喷出，锥形随机初速
+function spawn(p) {
+  const ang = rand(0, Math.PI * 2);
+  const speed = rand(1.4, 3.2);
+  const upBias = rand(0.55, 1.0);
+  p.x = 0; p.y = 0; p.z = 0;
+  p.vx = Math.cos(ang) * speed * (1 - upBias) * 0.9;
+  p.vy = upBias * speed;
+  p.vz = Math.sin(ang) * speed * (1 - upBias) * 0.9;
+  p.life = 0;
+  p.maxLife = rand(1.6, 2.6);
+  // 色相随粒子随机：焰心偏白黄，外围偏橙红 —— 用色相参数控制
+  p.hueShift = Math.random();
+}
+
+let emitAcc = 0;
+const EMIT_PER_SEC = 1400;  // 每秒发射数；池满后复用最老的粒子
+
+function update(dt) {
+  emitAcc += EMIT_PER_SEC * dt;
+  while (emitAcc >= 1) {
+    emitAcc -= 1;
+    // 简单回收：找第一个死亡粒子；池满时覆盖第 0 号（教学从简）
+    let slot = -1;
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      if (particles[i].life < 0) { slot = i; break; }
+    }
+    if (slot < 0) slot = (Math.random() * MAX_PARTICLES) | 0;
+    spawn(particles[slot]);
+  }
+
+  for (const p of particles) {
+    if (p.life < 0) continue;
+    p.life += dt;
+    if (p.life >= p.maxLife) { p.life = -1; continue; }
+    p.vy -= 4.5 * dt;              // 重力
+    p.vx *= 1 - 0.6 * dt;          // 空气阻力
+    p.vz *= 1 - 0.6 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.z += p.vz * dt;
+    if (p.y < -1.2) { p.life = -1; continue; }   // 落地消失
+  }
+}
+
+/* 把活着的粒子压平写进 gpuData，返回数量 */
+function fillGpuBuffer() {
+  let n = 0;
+  for (const p of particles) {
+    if (p.life < 0) continue;
+    const o = n * FLOATS_PER_PARTICLE;
+    gpuData[o]     = p.x;
+    gpuData[o + 1] = p.y;
+    gpuData[o + 2] = p.z;
+    gpuData[o + 3] = 0.10 + 0.08 * Math.sin(Math.PI * p.life / p.maxLife);   // 尺寸：两头小中间大
+    // 生命周期调色：白黄 -> 橙 -> 暗红
+    const k = p.life / p.maxLife;
+    gpuData[o + 4] = 1.0;
+    gpuData[o + 5] = 0.85 - 0.55 * k;
+    gpuData[o + 6] = 0.55 - 0.45 * k;
+    // 透明度：快速淡入 + 缓慢淡出（三角波）
+    gpuData[o + 7] = Math.min(k * 6, 1) * (1 - k);
+    n++;
+  }
+  return n;
+}
+
+gl.enable(gl.DEPTH_TEST);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+  return dpr;
+}
+resize();
+
+let last = null, clock = 0;
+let dprCache = Math.min(window.devicePixelRatio || 1, 2);
+
+function render(now) {
+  if (last === null) last = now;
+  const dt = Math.min((now - last) / 1000, 0.05);   // 粒子物理必须 clamp 大步长
+  last = now;
+  clock += dt;
+
+  const dpr = resize();
+  if (dpr) dprCache = dpr;
+
+  update(dt);
+
+  gl.clearColor(0.03, 0.035, 0.055, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  // 地面参考圆盘用一个大号暗粒子画（偷懒但直观）—— 正经项目用单独 pass
+  const view = M4.lookAt([0, 1.4, 4.6], [0, 0.6, 0], [0, 1, 0]);
+  const proj = M4.perspective(50 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100);
+
+  const n = fillGpuBuffer();
+
+  gl.useProgram(program);
+  gl.uniformMatrix4fv(uView, false, view);
+  gl.uniformMatrix4fv(uProj, false, proj);
+  gl.uniform1f(uDpr, dprCache);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  // 只上传活粒子那一段（n*10 个 float）—— 量小的时候差别不大，
+  // 池子几十万时「部分上传」是保命技巧
+  if (n > 0) {
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, gpuData.subarray(0, n * FLOATS_PER_PARTICLE));
+  }
+
+  /* ---------------- 粒子的混合策略 ----------------
+   * 加色混合 SRC_ALPHA, ONE：新颜色直接「加」到背景上。
+   * 火焰、光效、魔法 —— 重叠区域自然变亮，不需要排序！
+   * 因为加法满足交换律 —— 这就是粒子常用加色混合的隐藏原因。
+   * 代价：不能做「烟」这种遮挡型半透明（那是第 14 课的 alpha 混合）。 */
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.depthMask(false);        // 加色粒子也不写深度，避免互相剔除
+
+  gl.drawArrays(gl.POINTS, 0, n);
+
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 粒子系统的进阶话题：
+ *   GPU 模拟 —— 状态存进纹理，片元着色器更新（第 26 课 GPGPU 思路）
+ *   transform feedback（WebGL2）—— 顶点着色器输出直接写回缓冲
+ *   纹理图集粒子 —— gl_PointCoord 采样烟/火花贴图
+ *   软粒子 —— 采样场景深度，粒子贴近几何时淡出（避免硬切面）
+ *   排序 vs 加色 —— 遮挡型半透明粒子仍需按距离排序
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

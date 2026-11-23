@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>27 · 收官：迷你引擎架构（把 26 课收编成框架）</title>
+<!--
+  ============================================================
+  第 27 课：迷你引擎（Mini Engine）
+  ------------------------------------------------------------
+  前 26 课的代码都是「一个场景一套流程」的脚本。真实项目要的是
+  可以挂 N 个物体的框架。本课把散落各课的知识收编成 ~200 行的
+  迷你引擎，每个类都标注「来自第几课」。
+
+  架构分层（几乎所有引擎共有的骨架）：
+    Resource 层   Mesh / Material —— 数据与「怎么画」分离（第 20 课）
+    Scene 层      Node + Transform —— 层级与世界矩阵（第 20 课）
+    Renderer 层   收集 -> 排序 -> 绘制 —— draw call 管理（第 11/20 课）
+    Camera 层     投影 + 视图 + 视锥（第 7/10 课）
+
+  设计决策（有观点的部分）：
+    1. Material 持有 program 和 uniform 函数表 —— 同材质物体共享上传逻辑
+    2. 绘制列表先收集再排序，而不是递归边走边画 —— 给排序/剔除留机会
+    3. 每帧只 setProgram 一次/材质 —— 状态切换是最大隐形开销
+    4. 引擎不知道「时间」—— 动画由外部 update 注入（数据驱动）
+
+  HUD 显示每帧 draw call 数与 FPS —— 引擎自查的基本盘。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  .stats { position: fixed; right: 18px; top: 18px; font: 600 12px/1.8 ui-monospace, Consolas, monospace;
+           color: #7ee787; text-align: right; pointer-events: none; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 27 · FINALE</div>
+  <h1>迷你引擎：把 26 课收编成框架</h1>
+  <p>Mesh / Material / Node / Renderer 四层结构。3 个物体 2 种材质 = 每帧 3 次 draw call、1 次状态切换。</p>
+  <div class="tip">看右上角统计：draw calls / 状态切换 / FPS</div>
+</div>
+<div class="stats" id="stats"></div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 第 0 层：数学（第 6/7/9 课的成果原样搬进来）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  compose(pos, rotY, k) {              // 常用组合的语法糖（统一缩放）
+    const c = Math.cos(rotY), sn = Math.sin(rotY);
+    return new Float32Array([
+      c*k, 0, -sn*k, 0,
+      0, k, 0, 0,
+      sn*k, 0, c*k, 0,
+      pos[0], pos[1], pos[2], 1
+    ]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * Resource 层 1：Mesh（第 3/4/9 课）
+ * ----------------------------------------------------------------
+ * 数据结构：交错/分立的顶点流 + 索引 + attribute 布局描述。
+ * 设计点：Mesh 不含 GL 调用时机 —— 上传发生在构造，绘制交给 Renderer。
+ * ================================================================== */
+class Mesh {
+  constructor({ positions, normals, indices }) {
+    this.indexCount = indices.length;
+    this.vboPos = this._upload(gl.ARRAY_BUFFER, positions);
+    this.vboNor = this._upload(gl.ARRAY_BUFFER, normals);
+    this.ibo = this._upload(gl.ELEMENT_ARRAY_BUFFER, indices);
+  }
+  _upload(target, data) {
+    const b = gl.createBuffer();
+    gl.bindBuffer(target, b);
+    gl.bufferData(target, data, gl.STATIC_DRAW);
+    return b;
+  }
+  /* 绑定 attribute。Material 在 useProgram 之后调用它。
+   * 注意：材质的着色器可能不含某个 attribute（如自发光材质没有法线），
+   * getAttribLocation 会返回 -1 —— 必须跳过，否则产生 INVALID_VALUE。 */
+  bind(aPos, aNor) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboPos);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+    if (aNor >= 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.vboNor);
+      gl.enableVertexAttribArray(aNor);
+      gl.vertexAttribPointer(aNor, 3, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
+  }
+}
+
+/* 几何工厂：立方体 + 球 + 地面（第 7/9 课的生成器） */
+function cubeMesh() {
+  const p = new Float32Array([
+    -1,-1, 1,  1,-1, 1,  1, 1, 1,  -1, 1, 1,
+    -1,-1,-1,  1,-1,-1,  1, 1,-1,  -1, 1,-1
+  ]);
+  const n = new Float32Array([
+     0,0, 1, 0,0, 1, 0,0, 1, 0,0, 1,
+     0,0,-1, 0,0,-1, 0,0,-1, 0,0,-1
+  ]);
+  const i = new Uint16Array([
+    0,1,2, 0,2,3, 5,4,7, 5,7,6, 1,5,6, 1,6,2,
+    4,0,3, 4,3,7, 3,2,6, 3,6,7, 4,5,1, 4,1,0
+  ]);
+  return new Mesh({ positions: p, normals: n, indices: i });
+}
+function sphereMesh(seg = 28, ring = 18) {
+  const p = [], n = [], idx = [];
+  for (let y = 0; y <= ring; y++) {
+    const phi = (y / ring) * Math.PI;
+    for (let x = 0; x <= seg; x++) {
+      const theta = (x / seg) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      p.push(nx, ny, nz); n.push(nx, ny, nz);
+    }
+  }
+  const row = seg + 1;
+  for (let y = 0; y < ring; y++)
+    for (let x = 0; x < seg; x++) {
+      const a = y * row + x, b = a + row;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  return new Mesh({
+    positions: new Float32Array(p),
+    normals: new Float32Array(n),
+    indices: new Uint16Array(idx)
+  });
+}
+function groundMesh(size = 12) {
+  return new Mesh({
+    positions: new Float32Array([-size,0,-size, size,0,-size, size,0,size, -size,0,size]),
+    normals:   new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]),
+    indices:   new Uint16Array([0,2,1, 0,3,2])   // 从 +Y 看为逆时针，避免被剔除
+  });
+}
+
+/* ==================================================================
+ * Resource 层 2：Material（第 9/20 课）
+ * ----------------------------------------------------------------
+ * Material = program + uniform 上传函数表。
+ * setGlobals：每帧一次的「全局」uniform（相机、光、时间）
+ * setPerObject：每个物体一次的「个体」uniform（模型矩阵、颜色）
+ * 这个两段式就是排序分组能省状态切换的原因。
+ * ================================================================== */
+class Material {
+  constructor(vsSrc, fsSrc, hooks) {
+    this.program = createProgram(vsSrc, fsSrc);
+    this.hooks = hooks;             // { globals(u, env), perObject(u, obj) }
+    this.uniforms = {};
+    const n = gl.getProgramParameter(this.program, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) {
+      const info = gl.getActiveUniform(this.program, i);
+      this.uniforms[info.name] = gl.getUniformLocation(this.program, info.name);
+    }
+  }
+}
+
+/* 材质 1：Blinn-Phong（第 9 课） */
+const litMaterial = new Material(`
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  uniform mat4 uModel, uView, uProj;
+  uniform mat3 uNormalMat;
+  varying vec3 vN;
+  varying vec3 vW;
+  void main() {
+    vec4 w = uModel * vec4(aPos, 1.0);
+    vW = w.xyz;
+    vN = normalize(uNormalMat * aNormal);
+    gl_Position = uProj * uView * w;
+  }
+`, `
+  precision mediump float;
+  varying vec3 vN;
+  varying vec3 vW;
+  uniform vec3 uColor;
+  uniform vec3 uLightDir;
+  void main() {
+    vec3 N = normalize(vN);
+    vec3 L = normalize(uLightDir);
+    vec3 H = normalize(L + normalize(vec3(2.0, 3.0, 4.0) - vW));
+    float diff = max(dot(N, L), 0.0);
+    float spec = pow(max(dot(N, H), 0.0), 32.0);
+    vec3 c = uColor * (0.16 + 0.84 * diff) + vec3(spec * 0.4);
+    gl_FragColor = vec4(pow(c, vec3(1.0/2.2)), 1.0);
+  }
+`, {
+  globals(u, env) {
+    gl.uniformMatrix4fv(u.uView, false, env.view);
+    gl.uniformMatrix4fv(u.uProj, false, env.proj);
+    gl.uniform3fv(u.uLightDir, env.lightDir);
+  },
+  perObject(u, obj) {
+    gl.uniformMatrix4fv(u.uModel, false, obj.world);
+    gl.uniformMatrix3fv(u.uNormalMat, false, obj.normalMat);
+    gl.uniform3fv(u.uColor, obj.color);
+  }
+});
+
+/* 材质 2：自发光（第 20 课的太阳思路） */
+const glowMaterial = new Material(`
+  attribute vec3 aPos;
+  uniform mat4 uMvp;
+  void main() { gl_Position = uMvp * vec4(aPos, 1.0); }
+`, `
+  precision mediump float;
+  uniform vec3 uColor;
+  uniform float uTime;
+  void main() {
+    float pulse = 0.85 + 0.15 * sin(uTime * 3.0);
+    gl_FragColor = vec4(uColor * pulse, 1.0);
+  }
+`, {
+  globals(u, env) {
+    gl.uniform1f(u.uTime, env.time);
+  },
+  perObject(u, obj) {
+    gl.uniformMatrix4fv(u.uMvp, false, obj.mvp);
+    gl.uniform3fv(u.uColor, obj.color);
+  }
+});
+
+/* ==================================================================
+ * Scene 层：Node + Entity（第 20 课的场景图，简化为单层 + 动画钩子）
+ * ================================================================== */
+class Entity {
+  constructor({ mesh, material, color, update }) {
+    this.mesh = mesh;
+    this.material = material;
+    this.color = color;
+    this.update = update || (() => {});   // 每帧回调：写 this.transform
+    this.transform = M4.identity();
+    this.world = M4.identity();
+    this.normalMat = new Float32Array([1,0,0, 0,1,0, 0,0,1]);
+    this.mvp = M4.identity();
+  }
+}
+
+class Scene {
+  constructor() { this.entities = []; }
+  add(e) { this.entities.push(e); return this; }
+  update(dt, t) {
+    for (const e of this.entities) e.update(e, dt, t);
+  }
+}
+
+/* ==================================================================
+ * Renderer：收集 -> 按材质排序 -> 绘制（第 11/20 课的状态管理）
+ * ================================================================== */
+class Renderer {
+  constructor() {
+    this.stats = { draws: 0, switches: 0 };
+  }
+  render(scene, camera, env) {
+    this.stats.draws = 0;
+    this.stats.switches = 0;
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.04, 0.05, 0.08, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+
+    /* 1) 收集绘制项：真实引擎在这里做视锥剔除/透明排序分桶 */
+    const items = scene.entities.map(e => ({
+      mesh: e.mesh, material: e.material, entity: e,
+      sortKey: e.material === litMaterial ? 0 : 1   // 不透明在前，自发光在后
+    }));
+    items.sort((a, b) => a.sortKey - b.sortKey);
+
+    /* 2) 绘制：同一材质只在切换时 useProgram + 传 globals */
+    let current = null;
+    for (const it of items) {
+      if (it.material !== current) {
+        gl.useProgram(it.material.program);
+        it.material.hooks.globals(it.material.uniforms, env);
+        current = it.material;
+        this.stats.switches++;
+      }
+      // per-object uniform
+      const e = it.entity;
+      e.world = e.transform;
+      e.normalMat.set([e.world[0], e.world[1], e.world[2],
+                       e.world[4], e.world[5], e.world[6],
+                       e.world[8], e.world[9], e.world[10]]);
+      e.mvp = M4.chain(env.proj, env.view, e.world);
+      it.material.hooks.perObject(it.material.uniforms, e);
+
+      it.mesh.bind(
+        gl.getAttribLocation(current.program, 'aPos'),
+        gl.getAttribLocation(current.program, 'aNormal')
+      );
+      gl.drawElements(gl.TRIANGLES, it.mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+      this.stats.draws++;
+    }
+  }
+}
+
+/* ==================================================================
+ * 搭建：相机 + 场景 + 循环
+ * ================================================================== */
+const camera = {
+  fov: 48 * Math.PI / 180,
+  eye: [4.5, 3.2, 7.5],
+  target: [0, 0.8, 0]
+};
+const scene = new Scene();
+const renderer = new Renderer();
+
+const cube = cubeMesh();
+const ball = sphereMesh();
+const ground = groundMesh();
+
+scene.add(new Entity({
+  mesh: ground, material: litMaterial, color: [0.28, 0.31, 0.38],
+  update: () => {}
+}));
+scene.add(new Entity({
+  mesh: cube, material: litMaterial, color: [0.90, 0.45, 0.30],
+  update(e, dt, t) { e.transform = M4.compose([-1.8, 1.1, 0.2], t * 0.8, 0.55); }
+}));
+scene.add(new Entity({
+  mesh: ball, material: litMaterial, color: [0.30, 0.62, 0.95],
+  update(e, dt, t) {
+    e.transform = M4.compose([Math.cos(t * 0.7) * 1.6, 1.0 + Math.sin(t * 1.4) * 0.35, Math.sin(t * 0.7) * 1.6], 0, 0.8);
+  }
+}));
+scene.add(new Entity({
+  mesh: ball, material: glowMaterial, color: [1.0, 0.78, 0.35],
+  update(e, dt, t) {
+    // 发光小球 = 「灯泡」，顺便当作光源位置的视觉锚
+    e.transform = M4.compose([Math.cos(t * 0.9) * 3.0, 2.6 + Math.sin(t * 1.7), Math.sin(t * 0.9) * 3.0], 0, 0.22);
+  }
+}));
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+}
+
+let last = null, clock = 0, frames = 0, fpsT = 0;
+const statsEl = document.getElementById('stats');
+
+function frame(now) {
+  if (last === null) last = now;
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  clock += dt;
+
+  resize();
+  scene.update(dt, clock);
+
+  const view = M4.lookAt(camera.eye, camera.target, [0, 1, 0]);
+  const proj = M4.perspective(camera.fov, canvas.width / canvas.height, 0.1, 100);
+
+  // 光源位置跟随发光小球（引擎的灯光组件干的事，这里手动同步）
+  const glow = scene.entities[3];
+  const env = {
+    view, proj, time: clock,
+    lightDir: [
+      glow.transform[12] - 0, glow.transform[13], glow.transform[14]
+    ].map(v => v)
+  };
+  // 平移方向归一化成「表面->光源」的近似方向（演示够用）
+  const l = Math.hypot(env.lightDir[0], env.lightDir[1], env.lightDir[2]) || 1;
+  env.lightDir = [env.lightDir[0] / l, env.lightDir[1] / l, env.lightDir[2] / l];
+
+  renderer.render(scene, camera, env);
+
+  frames++; fpsT += dt;
+  if (fpsT >= 0.5) {
+    statsEl.innerHTML =
+      `draw calls: ${renderer.stats.draws}<br>` +
+      `program switches: ${renderer.stats.switches}<br>` +
+      `FPS: ${Math.round(frames / fpsT)}`;
+    frames = 0; fpsT = 0;
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ------------------------------------------------------------------
+ * 从这里走向真实引擎（three.js / Babylon / PlayCanvas 都长这样）：
+ *   渲染图（render graph）—— 管线 pass 的数据流描述与自动排序
+ *   延迟渲染 / 前向+ —— 多光源扩展（WebGL2 的 MRT 是门票）
+ *   资源管线 —— glTF 导入、纹理压缩（KTX2/Basis）、异步加载
+ *   剔除 —— 视锥、遮挡查询、GPU driven culling
+ *   多线程 —— Worker 里的物理/解码，OffscreenCanvas 渲染
+ *   WebGPU —— 第 26 课预告的接班人：计算着色器 + 显式管线控制
+ * 学完 27 课再读 three.js 的 WebGLRenderer 源码，应该处处似曾相识。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

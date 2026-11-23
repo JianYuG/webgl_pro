@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>24 · PBR：Cook-Torrance 微表面模型</title>
+<!--
+  ============================================================
+  第 24 课：PBR（Physically Based Rendering）入门
+  ------------------------------------------------------------
+  Blinn-Phong 是「看起来像光照」；PBR 是「按物理规律算光照」。
+  核心是 Cook-Torrance 镜面反射 BRDF：
+
+      f_spec = D(h) · F(v,h) · G(v,l) / (4 · (n·v) · (n·l))
+
+  三个因子各自回答一个问题：
+    D（法线分布）：这个方向上微表面法线有多少是对齐半程向量的？
+    F（菲涅尔）：   从这个角度看，反射占比是多少？
+    G（几何遮蔽）： 微表面互相遮挡，实际能出光的占比是多少？
+
+  本课新知识点：
+    1. GGX / Trowbridge-Reitz 法线分布
+    2. Smith-Schlick-GGX 几何项
+    3. Fresnel-Schlick 近似与 F0（基础反射率）
+    4. 金属度/粗糙度两个参数如何「统一」金属与非金属
+    5. 能量守恒：漫反射 × (1-F) —— 反射多了漫反射就得少
+
+  25 个球组成参数矩阵：横向粗糙度 0→1，纵向金属度 0→1。
+  这是 learnopengl.com 的经典演示布局。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 24</div>
+  <h1>PBR：Cook-Torrance 微表面模型</h1>
+  <p>5×5 球阵：横轴粗糙度递增（高光变宽变弱），纵轴金属度递增（颜色从塑料白变成金属本色）。</p>
+  <div class="tip">光源绕圈 · D×F×G 三个因子都在片元着色器里</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * PBR 着色器
+ * ----------------------------------------------------------------
+ * 常量约定（learnopengl 教材同款）：
+ *   非金属 F0 = 0.04（大多数绝缘体都在 2%~5% 反射）
+ *   金属 F0 = albedo（金属没有「固有色」，只有反射色）
+ *   albedo = baseColor * (1 - metallic) 混合 F0
+ * ================================================================== */
+const program = createProgram(`
+  attribute vec3 aPos;
+  attribute vec3 aNormal;
+  uniform mat4 uModel, uView, uProj;
+  uniform mat3 uNormalMat;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+  void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos = world.xyz;
+    vNormal = normalize(uNormalMat * aNormal);
+    gl_Position = uProj * uView * world;
+  }
+`, `
+  precision highp float;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+
+  uniform vec3 uEye;
+  uniform vec3 uLightPos;
+  uniform vec3 uBaseColor;
+  uniform float uMetallic;     // 0 塑料 ... 1 纯金属
+  uniform float uRoughness;    // 0 镜面 ... 1 完全粗糙
+
+  const float PI = 3.14159265359;
+
+  /* ---- D：GGX 法线分布 ----
+   * 粗糙度越低，α² 越小，分母越接近 0 —— 高光越尖。
+   * (n·h)² 项决定「法线恰好对齐半程向量」的微表面有多少。 */
+  float D_GGX(float NdotH, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+  }
+
+  /* ---- G：Smith-Schlick-GGX 几何遮蔽 ----
+   * 微表面是凹凸的：出射光可能被旁边的凸起挡住。
+   * Schlick-GGX 用 k 近似 Smith 积分。 */
+  float G_Schlick(float NdotV, float NdotL, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;                 // 直接光用 /8（IBL 用 /2，注意区分）
+    float gv = NdotV / (NdotV * (1.0 - k) + k);
+    float gl = NdotL / (NdotL * (1.0 - k) + k);
+    return gv * gl;
+  }
+
+  /* ---- F：Fresnel-Schlick ----
+   * F0 = 正入射（垂直看）时的反射率。掠射角反射趋近 1 ——
+   * 这就是为什么球的边缘永远更亮。 */
+  vec3 F_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+  }
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(uEye - vWorldPos);
+    vec3 L = normalize(uLightPos - vWorldPos);
+    vec3 H = normalize(V + L);
+
+    float NdotV = max(dot(N, V), 1e-4);
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    // F0：非金属 0.04，金属用固有色
+    vec3 F0 = mix(vec3(0.04), uBaseColor, uMetallic);
+
+    // 三因子
+    vec3  F = F_Schlick(VdotH, F0);
+    float D = D_GGX(NdotH, uRoughness);
+    float G = G_Schlick(NdotV, NdotL, uRoughness);
+
+    // 镜面项 spec = D·F·G / (4·NdotV·NdotL)，NdotL 挪出去乘
+    vec3 spec = (D * F * G) / max(4.0 * NdotV * NdotL, 1e-4) * NdotL;
+
+    // 漫反射：Lambert + 能量守恒（kS = F，反射掉的不再漫反射）
+    vec3 kD = (1.0 - F) * (1.0 - uMetallic);   // 金属没有漫反射！
+    vec3 diffuse = kD * uBaseColor / PI * NdotL;
+
+    // 光源强度 + 距离衰减（能量常数取得较大，抵消 1/d² 的快速衰减）
+    float dist = length(uLightPos - vWorldPos);
+    vec3 radiance = vec3(70.0) / (dist * dist);
+
+    // 环境光：没有 IBL 时用常数近似（第 17 课的环境贴图可以做真 IBL）
+    vec3 ambient = vec3(0.03) * uBaseColor;
+
+    vec3 color = ambient + (diffuse + spec) * radiance;
+
+    /* HDR -> 显示器：
+     * PBR 算出的是线性 HDR 值（高光可以远超 1），
+     * 先做色调映射压回 [0,1]，再 gamma 校正。顺序不能反！ */
+    color = color / (color + vec3(1.0));        // Reinhard（第 9 课提过它压对比）
+    // 替代方案 ACES filmic（更讨喜的滚降曲线）：
+    // color = (color * (2.51*color + 0.03)) / (color*(2.43*color+0.59)+0.14);
+    color = pow(color, vec3(1.0/2.2));
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`);
+gl.useProgram(program);
+
+/* ---------------- 球体网格（第 9 课同款） ---------------- */
+function makeSphere(radius, segments, rings) {
+  const positions = [], normals = [], indices = [];
+  for (let y = 0; y <= rings; y++) {
+    const phi = (y / rings) * Math.PI;
+    for (let x = 0; x <= segments; x++) {
+      const theta = (x / segments) * Math.PI * 2;
+      const nx = Math.sin(phi) * Math.cos(theta);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(theta);
+      positions.push(nx * radius, ny * radius, nz * radius);
+      normals.push(nx, ny, nz);
+    }
+  }
+  const rowLen = segments + 1;
+  for (let y = 0; y < rings; y++)
+    for (let x = 0; x < segments; x++) {
+      const a = y * rowLen + x, b = a + rowLen;
+      indices.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+  return {
+    positions: new Float32Array(positions),
+    normals: new Float32Array(normals),
+    indices: new Uint16Array(indices)
+  };
+}
+const sphere = makeSphere(0.62, 40, 28);
+
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+buf(gl.ARRAY_BUFFER, sphere.positions);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aPos'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aPos'), 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, sphere.normals);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aNormal'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aNormal'), 3, gl.FLOAT, false, 0, 0);
+buf(gl.ELEMENT_ARRAY_BUFFER, sphere.indices);
+
+const uModel = gl.getUniformLocation(program, 'uModel');
+const uView  = gl.getUniformLocation(program, 'uView');
+const uProj  = gl.getUniformLocation(program, 'uProj');
+const uNorMat= gl.getUniformLocation(program, 'uNormalMat');
+const uEye   = gl.getUniformLocation(program, 'uEye');
+const uLightPos = gl.getUniformLocation(program, 'uLightPos');
+const uBase  = gl.getUniformLocation(program, 'uBaseColor');
+const uMetal = gl.getUniformLocation(program, 'uMetallic');
+const uRough = gl.getUniformLocation(program, 'uRoughness');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.02, 0.025, 0.04, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const eye = [0, 0.4, 11.5];
+  const view = M4.lookAt(eye, [0, 0, 0], [0, 1, 0]);
+  const proj = M4.perspective(45 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100);
+
+  gl.uniformMatrix4fv(uView, false, view);
+  gl.uniformMatrix4fv(uProj, false, proj);
+  gl.uniform3fv(uEye, eye);
+
+  // 光源绕 Z 轴转圈（在场景前上方），微表面高光随之流动
+  const lightPos = [Math.cos(t * 0.8) * 4.5, Math.sin(t * 0.8) * 3.0 + 2.2, 4.2];
+  gl.uniform3fv(uLightPos, lightPos);
+
+  /* 5×5 参数矩阵：列 = 粗糙度 0.05..0.95，行 = 金属度 0..1 */
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 5; col++) {
+      const x = (col - 2) * 1.7;
+      const y = (2 - row) * 1.7;
+
+      const model = M4.translate(x, y, 0);
+      gl.uniformMatrix4fv(uModel, false, model);
+      gl.uniformMatrix3fv(uNorMat, false, M4.identity().slice(0, 9));
+
+      gl.uniform3f(uBase, 0.85, 0.55, 0.25);              // 铜色
+      gl.uniform1f(uMetal, row / 4);                      // 0 -> 1
+      gl.uniform1f(uRough, Math.max(0.05, col / 4));      // 0.05 -> 1
+
+      gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_SHORT, 0);
+    }
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * PBR 的进阶话题：
+ *   IBL（基于图像的光照）—— 用第 17 课的环境 cubemap 做真实环境光：
+ *     漫反射用 irradiance cubemap（低通滤波），镜面用预滤波 mipmap 链
+ *     + BRDF LUT，两步都是预计算
+ *   贴图化 —— metallicRoughness / normal / ao 贴图按像素驱动这些参数
+ *   线性色彩空间管线 —— sRGB 贴图要解码到线性再计算（sRGB 硬件格式）
+ *   glTF PBR —— metallic-roughness 工作流是事实标准（three.js/Babylon 默认）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

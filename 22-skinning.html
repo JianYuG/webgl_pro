@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>22 · 骨骼蒙皮：关节矩阵与顶点权重</title>
+<!--
+  ============================================================
+  第 22 课：骨骼蒙皮动画（Skinning）
+  ------------------------------------------------------------
+  角色动画的核心问题：怎么让「覆盖在骨架上的皮肤」跟着关节弯？
+  答案分三步：
+    1. 骨架（skeleton）：一串带层级/位置信息的关节
+    2. 蒙皮（skin）：网格每个顶点记录「受哪几个关节影响、各占多少」
+    3. 调色板（palette）：把每个关节的当前变换矩阵传进顶点着色器，
+       顶点位置 = Σ 权重ᵢ × JointMatᵢ × 原始位置
+
+  本课新知识点：
+    1. uniform 矩阵数组 uJointMats[8] 与 uniformMatrix4fv 的扁平上传
+    2. 顶点的双关节权重属性（vec2 索引 + vec2 权重）
+    3. 关节矩阵 = translate(关节位置) * rotate(关节角度)
+    4. 为什么蒙皮要在「模型空间」做、在世界变换之前
+    5. 线性混合蒙皮（LBS）的固有问题：关节处体积损失（"糖果纸"效应）
+
+  本课的「蛇」没有真正的层级关节 —— 每节直接相对模型空间旋转，
+  这是教学简化；真实角色骨骼是父子链，矩阵要先逐级相乘（第 20 课场景图）。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 22</div>
+  <h1>骨骼蒙皮：关节矩阵与顶点权重</h1>
+  <p>一条 32 段的「蛇」：8 个关节各按相位差摆动，蒙皮顶点在相邻两个关节的矩阵间插值。</p>
+  <div class="tip">顶点着色器里：pos = w0·J0·p + w1·J1·p</div>
+</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  translate: (x, y, z) => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]),
+  rotateZ(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,s,0,0, -s,c,0,0, 0,0,1,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 蒙皮顶点着色器 —— 本课的核心
+ * ----------------------------------------------------------------
+ * 流程（顺序很重要！）：
+ *   1. 先用关节矩阵把「绑定姿势」的顶点变到当前姿势（模型空间内）
+ *   2. 再乘世界矩阵走到世界空间
+ *   3. 法线同理：关节矩阵的旋转部分 + 模型的旋转
+ * 关节矩阵数组用 uniform 传：8 个 mat4 = 128 个 float，完全没压力。
+ * 真实引擎（60~100 根骨头）会配 uniform 上限检查或用纹理存矩阵。
+ * ================================================================== */
+const program = createProgram(`
+  attribute vec3  aPos;        // 绑定姿势（T-pose 般的初始位置）
+  attribute vec3  aNormal;
+  attribute vec2  aJoints;     // 影响该顶点的两个关节索引
+  attribute vec2  aWeights;    // 对应权重，w0 + w1 = 1
+
+  uniform mat4 uJointMats[8];  // 关节调色板（模型空间）
+  uniform mat4 uModel;
+  uniform mat4 uView;
+  uniform mat4 uProj;
+
+  varying vec3 vNormal;
+  varying vec3 vWorldPos;
+
+  void main() {
+    // 1) 线性混合蒙皮（LBS）：两个关节矩阵各自作用后再加权平均
+    //    （先各自变换再混合 == 混合矩阵后变换，LBS 用后者省一次乘）
+    mat4 skin =
+        aWeights.x * uJointMats[int(aJoints.x)]
+      + aWeights.y * uJointMats[int(aJoints.y)];
+
+    vec4 skinnedPos = skin * vec4(aPos, 1.0);
+    // 法线用矩阵的 3x3 部分（关节只含旋转+平移，不破坏正交性）
+    vec3 skinnedNormal = mat3(skin) * aNormal;
+
+    vec4 world = uModel * skinnedPos;
+    vWorldPos = world.xyz;
+    vNormal = normalize(mat3(uModel) * skinnedNormal);
+    gl_Position = uProj * uView * world;
+  }
+`, `
+  precision mediump float;
+  varying vec3 vNormal;
+  varying vec3 vWorldPos;
+  uniform vec3 uLightDir;
+  uniform vec3 uBaseColor;
+
+  void main() {
+    vec3 N = normalize(vNormal);
+    float diff = max(dot(N, normalize(uLightDir)), 0.0);
+    // 沿身体的节状条纹：让扭动更容易看清
+    float stripe = 0.85 + 0.15 * sin(vWorldPos.x * 14.0);
+    vec3 color = uBaseColor * stripe * (0.25 + 0.75 * diff);
+    color = pow(color, vec3(1.0/2.2));
+    gl_FragColor = vec4(color, 1.0);
+  }
+`);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 蒙皮网格：一条截面为圆形的长条
+ * ----------------------------------------------------------------
+ * 沿 X 轴铺 SECTIONS+1 个截面环，每环 8 个顶点。
+ * 每个顶点的关节归属由其 x 位置决定（连续映射到 [0, JOINTS-1]）。
+ * ================================================================== */
+const SECTIONS = 32;
+const RING = 8;
+const BODY_LEN = 6.0;
+const JOINTS = 8;
+
+function buildSnakeMesh() {
+  const pos = [], nor = [], joints = [], weights = [], idx = [];
+  for (let s = 0; s <= SECTIONS; s++) {
+    const t = s / SECTIONS;                    // 0..1 沿身体
+    const x = t * BODY_LEN - BODY_LEN / 2;
+    // 身体轮廓：头粗尾细（正弦包络）
+    const radius = 0.42 * Math.sqrt(Math.sin(Math.min(t * 1.15, 1) * Math.PI)) + 0.06;
+
+    // 关节归属：把 [0, BODY_LEN] 映射到 [0, JOINTS-1]，取相邻两个
+    const f = t * (JOINTS - 1);
+    const j0 = Math.min(Math.floor(f), JOINTS - 2);
+    const w1 = f - j0;                          // j1 的权重
+
+    for (let r = 0; r < RING; r++) {
+      const a = (r / RING) * Math.PI * 2;
+      const cy = Math.cos(a), cz = Math.sin(a);
+      pos.push(x, cy * radius, cz * radius);
+      nor.push(0, cy, cz);
+      joints.push(j0, j0 + 1);
+      weights.push(1 - w1, w1);
+    }
+  }
+  // 相邻两个截面环连成四边形，环内首尾相接（idx 已在函数开头声明）
+  for (let s = 0; s < SECTIONS; s++) {
+    for (let r = 0; r < RING; r++) {
+      const r2 = (r + 1) % RING;
+      const a = s * RING + r;        // 当前环 r
+      const b = s * RING + r2;       // 当前环 r+1
+      const c = (s + 1) * RING + r;  // 下一环 r
+      const d = (s + 1) * RING + r2; // 下一环 r+1
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  return {
+    pos: new Float32Array(pos), nor: new Float32Array(nor),
+    joints: new Float32Array(joints), weights: new Float32Array(weights),
+    idx: new Uint16Array(idx)
+  };
+}
+const mesh = buildSnakeMesh();
+
+function buf(target, data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(target, b);
+  gl.bufferData(target, data, gl.STATIC_DRAW);
+  return b;
+}
+buf(gl.ARRAY_BUFFER, mesh.pos);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aPos'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aPos'), 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, mesh.nor);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aNormal'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aNormal'), 3, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, mesh.joints);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aJoints'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aJoints'), 2, gl.FLOAT, false, 0, 0);
+buf(gl.ARRAY_BUFFER, mesh.weights);
+gl.enableVertexAttribArray(gl.getAttribLocation(program, 'aWeights'));
+gl.vertexAttribPointer(gl.getAttribLocation(program, 'aWeights'), 2, gl.FLOAT, false, 0, 0);
+buf(gl.ELEMENT_ARRAY_BUFFER, mesh.idx);
+
+const uModel = gl.getUniformLocation(program, 'uModel');
+const uView = gl.getUniformLocation(program, 'uView');
+const uProj = gl.getUniformLocation(program, 'uProj');
+const uLight = gl.getUniformLocation(program, 'uLightDir');
+const uColor = gl.getUniformLocation(program, 'uBaseColor');
+const uJointLoc = gl.getUniformLocation(program, 'uJointMats');
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+/* 关节摆动参数：相位差让波动沿身体传播 —— 行波 = 蛇的游动 */
+const AMP = 0.45;        // 摆幅（弧度）
+const SPEED = 3.2;       // 频率
+const PHASE = 0.9;       // 相邻关节相位差
+
+const jointMats = new Float32Array(JOINTS * 16);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.04, 0.05, 0.08, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  /* ---- CPU 侧：算关节调色板 ----
+   * 关节 i 位于 x_i = i/(JOINTS-1)*BODY_LEN - BODY_LEN/2，
+   * 角度 θ_i = AMP * sin(SPEED*t - i*PHASE)。
+   * 矩阵 = translate(x_i, 0, 0) * rotateZ(θ_i)。
+   * 注意顶点在绑定姿势的 x 就落在关节附近，旋转轴穿过关节 ——
+   * 这就是「关节位置平移放在旋转之前」的意义。 */
+  for (let i = 0; i < JOINTS; i++) {
+    const xi = (i / (JOINTS - 1)) * BODY_LEN - BODY_LEN / 2;
+    const ang = AMP * Math.sin(SPEED * t - i * PHASE);
+    const m = M4.mul(M4.translate(xi, 0, 0), M4.rotateZ(ang));
+    jointMats.set(m, i * 16);
+  }
+  // 扁平数组一次上传全部 8 个 mat4
+  gl.uniformMatrix4fv(uJointLoc, false, jointMats);
+
+  // 模型：整条蛇轻微起伏 + 绕 Y 慢转，方便四面观察
+  const model = M4.chain(
+    M4.rotateY(t * 0.35),
+    M4.translate(0, 1.0, 0)
+  );
+
+  gl.uniformMatrix4fv(uModel, false, model);
+  gl.uniformMatrix4fv(uView, false, M4.lookAt([0, 1.6, 6.4], [0, 0.9, 0], [0, 1, 0]));
+  gl.uniformMatrix4fv(uProj, false, M4.perspective(48 * Math.PI / 180, canvas.width / canvas.height, 0.1, 100));
+  gl.uniform3f(uLight, 0.4, 0.85, 0.5);
+  gl.uniform3f(uColor, 0.30, 0.72, 0.52);
+
+  gl.drawElements(gl.TRIANGLES, mesh.idx.length, gl.UNSIGNED_SHORT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 蒙皮的进阶话题：
+ *   骨骼层级 —— 关节矩阵 = 父关节矩阵 * 局部矩阵（第 20 课场景图直接适用）
+ *   动画混合 —— 两段关键帧姿势的矩阵做插值（slerp 旋转部分）
+ *   LBS 修正 —— "糖果纸"塌陷：对混合后的顶点重新归一化长度/用 DQS 对偶四元数
+ *   大骨骼数 —— uniform 空间不够时把调色板放进纹理采样
+ *   glTF —— 工业标准的蒙皮数据格式（JOINTS_0/WEIGHTS_0 语义）
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

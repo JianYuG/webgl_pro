@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · 认识 WebGL：拿到上下文</title>
+<!--
+  ============================================================
+  第 1 课：WebGL 到底是什么
+  ------------------------------------------------------------
+  目标：不画任何图形，先确认三件事
+        1. 如何拿到 WebGL 渲染上下文（gl）
+        2. 画布尺寸为什么要分成 CSS 像素和物理像素两套
+        3. 一帧最基本的绘制流程：resize -> clear -> 提交
+
+  核心认知：WebGL 本身只是一台「状态机 + 两个 GPU 函数」。
+           你设置一堆状态，然后调用 drawArrays/drawElements 让它画。
+           所有几何、光照、材质，都是你自己写着色器算出来的。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 01</div>
+  <h1>认识 WebGL：拿到上下文</h1>
+  <p>画布正在被 GPU 以呼吸节奏清屏。右下角是驱动报上来的真实信息。</p>
+  <div class="tip" id="info">检测中…</div>
+</div>
+
+<script>
+/* ------------------------------------------------------------------
+ * 1. 获取渲染上下文
+ *    getContext('webgl') 返回 WebGLRenderingContext（基于 OpenGL ES 2.0）。
+ *    如果返回 null，说明浏览器禁用或不支持 WebGL —— 必须处理这个分支，
+ *    否则后面所有 gl.xxx 调用都会抛 "Cannot read properties of null"。
+ *
+ *    这里额外传了 alpha:false，告诉浏览器画布不需要透明，
+ *    合成阶段可以少一次混合，纯色背景场景能省一点带宽。
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', {
+  alpha: false,          // 画布不要透明通道
+  antialias: true,       // 请求 MSAA（浏览器可以拒绝，不是强制项）
+  depth: true,           // 需要深度缓冲（3D 才用得上，这里先要着）
+  premultipliedAlpha: true
+});
+
+if (!gl) {
+  document.getElementById('info').textContent =
+    '当前浏览器无法创建 WebGL 上下文，请检查 chrome://gpu 或开启硬件加速。';
+  throw new Error('WebGL not supported');
+}
+
+/* ------------------------------------------------------------------
+ * 2. 画布尺寸的两套坐标
+ *    canvas.width/height  = 帧缓冲的真实像素数（GPU 实际画多少格子）
+ *    canvas.clientWidth   = CSS 布局尺寸（屏幕上占多大）
+ *    只设置 CSS 会让画面被拉伸 -> 模糊；只设置 width 会让元素变形。
+ *    正确做法：两者都管，并按设备像素比(DPR)放大帧缓冲。
+ *
+ *    DPR 常见 1(普通屏) / 2(Retina、手机) / 3(高分屏)，
+ *    这里用 Math.min(dpr, 2) 封顶：4K 屏上渲染 3 倍像素性价比很低。
+ * ------------------------------------------------------------------ */
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width === w && canvas.height === h) return;  // 尺寸没变就别白折腾
+
+  canvas.width = w;
+  canvas.height = h;
+  // viewport 决定「裁剪空间 -> 屏幕像素」的映射范围，尺寸变了必须同步，
+  // 否则画面只会占据左下角的一块（典型的 resize 忘了改 viewport 的 bug）。
+  gl.viewport(0, 0, w, h);
+}
+
+/* ------------------------------------------------------------------
+ * 3. 一帧的绘制：清屏
+ *    clearColor 接收归一化的 RGBA（0.0 ~ 1.0），不是 0~255。
+ *    alpha 只有在创建上下文时 alpha:true 才真正生效。
+ * ------------------------------------------------------------------ */
+let startTime = performance.now();
+
+function render(now) {
+  const t = (now - startTime) / 1000;      // 秒
+
+  resize();                                 // 每帧检查尺寸（用户可能刚拖动过窗口）
+
+  // 呼吸动画：sin 在 [-1,1]，映射到 [0,1] 后插值出一个暗蓝色
+  const k = 0.5 + 0.5 * Math.sin(t * 0.9);
+  gl.clearColor(0.02 + 0.04 * k, 0.03 + 0.07 * k, 0.07 + 0.16 * k, 1.0);
+
+  // COLOR_BUFFER_BIT = 颜色缓冲；3D 场景还要 | DEPTH_BUFFER_BIT 清深度
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 4. 读一点真实的驱动信息，显示在 HUD 上
+ *    WEBGL_debug_renderer_info 是可选扩展，隐私模式下可能被屏蔽。
+ * ------------------------------------------------------------------ */
+(function showInfo() {
+  resize();   // 先同步一次尺寸，否则显示的是画布默认的 300×150
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  const renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  const vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+
+  document.getElementById('info').innerHTML =
+    'WebGL ' + gl.getParameter(gl.VERSION).replace('WebGL ', '') + ' · ' +
+    'GLSL ' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION).replace('WebGL GLSL ES ', '') + '<br>' +
+    'GPU: ' + renderer + '<br>' +
+    '厂商: ' + vendor + '<br>' +
+    'DPR: ' + (window.devicePixelRatio || 1) + ' · 帧缓冲: ' +
+    canvas.width + '×' + canvas.height;
+})();
+
+/* ------------------------------------------------------------------
+ * 5. 一个好习惯：把上下文丢失当成真实场景处理
+ *    显卡驱动更新、系统休眠、标签页被回收，都会触发 webglcontextlost。
+ * ------------------------------------------------------------------ */
+canvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault();
+  document.getElementById('info').textContent = 'WebGL 上下文丢失（GPU 重置）。刷新页面即可恢复。';
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · 离屏渲染：帧缓冲与后处理</title>
+<!--
+  ============================================================
+  第 12 课：渲染到纹理（Render to Texture）
+  ------------------------------------------------------------
+  所有后处理（泛光、景深、色调映射、抗锯齿、毛玻璃）的前提都是同一件事：
+  先画到一张纹理上，再把这张纹理当输入画一遍。
+
+  本课新知识点：
+    1. 帧缓冲对象 FBO：让绘制目标从「屏幕」换成「纹理」
+    2. 深度渲染缓冲 renderbuffer —— FBO 默认没有深度，3D 场景会穿模
+    3. 全屏四边形（Fullscreen Quad）画法
+    4. 后处理着色器：灰度、暗角、扫描线、色散、噪点
+    5. FBO 尺寸必须跟着画布重建（否则窗口一变就花了）
+
+  按空格切换「后处理 on/off」，直观对比。
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(440px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+  .badge { position: fixed; right: 18px; top: 18px; font: 600 12px/1 ui-monospace, Consolas, monospace;
+           color: #0b0e14; background: #7ee787; padding: 8px 12px; border-radius: 999px; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 12</div>
+  <h1>离屏渲染：帧缓冲与后处理</h1>
+  <p>场景先画进一张纹理，再用全屏四边形把纹理处理后贴到屏幕上。</p>
+  <div class="tip">按空格切换后处理 · 缩放窗口观察 FBO 重建</div>
+</div>
+<div class="badge" id="badge">POST ON</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+const M4 = {
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+/* ==================================================================
+ * 第一套程序：渲染场景（和前面的课程一样）
+ * ================================================================== */
+const sceneProgram = createProgram(`
+  attribute vec3 aPos;
+  uniform mat4 uMvp;
+  varying vec3 vColor;
+
+  void main() {
+    gl_Position = uMvp * vec4(aPos, 1.0);
+    vColor = normalize(aPos) * 0.5 + 0.5;     // 简单渐变，让画面有辨识度
+  }
+`, `
+  precision mediump float;
+  varying vec3 vColor;
+  void main() {
+    // 加一点假光照：按屏幕空间高度提亮，视觉上更像一个立体物
+    float shade = 0.65 + 0.35 * vColor.g;
+    gl_FragColor = vec4(vColor * shade, 1.0);
+  }
+`);
+
+/* ==================================================================
+ * 第二套程序：后处理（全屏四边形 + 采样纹理）
+ * ----------------------------------------------------------------
+ * 全屏四边形的顶点直接写在裁剪空间：(-1,-1) 到 (1,1)，
+ * 不需要任何矩阵，因为它本来就铺满整个屏幕。
+ * ================================================================== */
+const postProgram = createProgram(`
+  attribute vec2 aPos;
+  attribute vec2 aUv;
+  varying vec2 vUv;
+
+  void main() {
+    vUv = aUv;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`, `
+  precision mediump float;
+
+  varying vec2 vUv;
+  uniform sampler2D uScene;
+  uniform vec2      uResolution;
+  uniform float     uTime;
+  uniform float     uEnabled;    // 0 = 直通，1 = 开特效
+
+  // 便宜的伪随机噪点
+  float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+  }
+
+  void main() {
+    vec2 uv = vUv;
+
+    // 1) 色散：R/G/B 三个通道各偏移一点点采样位置（CRT 显示器质感）
+    float aberration = 0.0025 * uEnabled;
+    vec3 col;
+    col.r = texture2D(uScene, uv + vec2( aberration, 0.0)).r;
+    col.g = texture2D(uScene, uv).g;
+    col.b = texture2D(uScene, uv - vec2( aberration, 0.0)).b;
+
+    // 2) 暗角：离画面中心越远越暗
+    vec2 d = uv - 0.5;
+    float vignette = 1.0 - dot(d, d) * 1.1;
+    col *= mix(1.0, vignette, uEnabled);
+
+    // 3) 扫描线：每 2 个像素一条暗线
+    float scan = 0.94 + 0.06 * sin(uv.y * uResolution.y * 3.14159);
+    col *= mix(1.0, scan, uEnabled);
+
+    // 4) 噪点：每帧都变，模拟胶片颗粒
+    col += (hash(uv * uResolution + uTime) - 0.5) * 0.05 * uEnabled;
+
+    // 5) 转灰度一半，让整体色调偏冷
+    float gray = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(col, vec3(gray), 0.35 * uEnabled);
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`);
+
+/* ==================================================================
+ * 几何
+ * ================================================================== */
+const cubePos = new Float32Array([
+  -1,-1, 1,   1,-1, 1,   1, 1, 1,  -1, 1, 1,
+  -1,-1,-1,   1,-1,-1,   1, 1,-1,  -1, 1,-1
+]);
+const cubeIdx = new Uint16Array([
+  0,1,2, 0,2,3,   5,4,7, 5,7,6,
+  1,5,6, 1,6,2,   4,0,3, 4,3,7,
+  3,2,6, 3,6,7,   4,5,1, 4,1,0
+]);
+
+const cubeVbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cubeVbo);
+gl.bufferData(gl.ARRAY_BUFFER, cubePos, gl.STATIC_DRAW);
+
+const cubeIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cubeIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cubeIdx, gl.STATIC_DRAW);
+
+// 全屏四边形：位置 + UV 交错
+const quadData = new Float32Array([
+  // x    y     u    v
+  -1,  -1,    0,   0,
+   1,  -1,    1,   0,
+   1,   1,    1,   1,
+  -1,   1,    0,   1
+]);
+const quadIdx = new Uint16Array([0,1,2, 0,2,3]);
+
+const quadVbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+gl.bufferData(gl.ARRAY_BUFFER, quadData, gl.STATIC_DRAW);
+
+const quadIbo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIbo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIdx, gl.STATIC_DRAW);
+
+const sceneAPos  = gl.getAttribLocation(sceneProgram, 'aPos');
+const uMvpLoc    = gl.getUniformLocation(sceneProgram, 'uMvp');
+
+const postAPos   = gl.getAttribLocation(postProgram, 'aPos');
+const postAUv    = gl.getAttribLocation(postProgram, 'aUv');
+const uSceneLoc  = gl.getUniformLocation(postProgram, 'uScene');
+const uResLoc    = gl.getUniformLocation(postProgram, 'uResolution');
+const uTimeLoc   = gl.getUniformLocation(postProgram, 'uTime');
+const uEnabledLoc= gl.getUniformLocation(postProgram, 'uEnabled');
+
+/* ==================================================================
+ * FBO：把「画到屏幕」改成「画到纹理」
+ * ----------------------------------------------------------------
+ * 一个帧缓冲需要挂三样东西：
+ *   颜色附件  texture       —— 之后会被后处理采样
+ *   深度附件  renderbuffer  —— 保证 3D 遮挡关系正确
+ *   模板附件  本例不需要
+ *
+ * 少了深度附件，立方体各面会按绘制顺序互相覆盖（第 7 课那个问题的翻版）。
+ * ================================================================== */
+const fbo = gl.createFramebuffer();
+const colorTex = gl.createTexture();
+const depthRb = gl.createRenderbuffer();
+
+let fboWidth = 0, fboHeight = 0;
+
+function resizeFBO(w, h) {
+  if (w === fboWidth && h === fboHeight) return;
+  fboWidth = w; fboHeight = h;
+
+  gl.bindTexture(gl.TEXTURE_2D, colorTex);
+  // 注意内部格式必须和 texImage2D 的 format 一致；NPOT 尺寸下不能开 mipmap，
+  // WRAP 也必须用 CLAMP_TO_EDGE。
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colorTex, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+
+  // 一定要检查完整性，否则黑屏时完全查不出原因
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) {
+    throw new Error('FBO 不完整: 0x' + status.toString(16));
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);   // 恢复默认（屏幕）帧缓冲
+}
+
+/* ------------------------------------------------------------------
+ * 交互：空格切换后处理
+ * ------------------------------------------------------------------ */
+let postEnabled = true;
+const badge = document.getElementById('badge');
+window.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  postEnabled = !postEnabled;
+  badge.textContent = postEnabled ? 'POST ON' : 'POST OFF';
+  badge.style.background = postEnabled ? '#7ee787' : '#f0b429';
+});
+
+gl.enable(gl.DEPTH_TEST);
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  // ---- 尺寸同步 ----
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    resizeFBO(w, h);          // FBO 也必须跟着重建，否则纹理尺寸对不上画布
+  }
+
+  /* ================================================================
+   * Pass 1：场景 -> FBO
+   * ================================================================ */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, fboWidth, fboHeight);
+  gl.clearColor(0.05, 0.06, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(sceneProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeVbo);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cubeIbo);
+  gl.enableVertexAttribArray(sceneAPos);
+  gl.vertexAttribPointer(sceneAPos, 3, gl.FLOAT, false, 0, 0);
+
+  const aspect = fboWidth / fboHeight;
+  const proj = M4.perspective(50 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt([0, 1.1, 4.6], [0, 0, 0], [0, 1, 0]);
+  const model = M4.chain(M4.rotateY(t * 0.7), M4.rotateX(t * 0.42));
+
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+
+  /* ================================================================
+   * Pass 2：FBO 纹理 -> 屏幕
+   * ================================================================ */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.DEPTH_TEST);      // 后处理是全屏覆盖，不需要深度
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(postProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIbo);
+
+  gl.enableVertexAttribArray(postAPos);
+  gl.vertexAttribPointer(postAPos, 2, gl.FLOAT, false, 4 * 4, 0);
+  gl.enableVertexAttribArray(postAUv);
+  gl.vertexAttribPointer(postAUv, 2, gl.FLOAT, false, 4 * 4, 2 * 4);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, colorTex);
+  gl.uniform1i(uSceneLoc, 0);
+  gl.uniform2f(uResLoc, w, h);
+  gl.uniform1f(uTimeLoc, t);
+  gl.uniform1f(uEnabledLoc, postEnabled ? 1 : 0);
+
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+  gl.enable(gl.DEPTH_TEST);       // 还原状态，给下一帧的 Pass 1 用
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 后处理的常见坑：
+ *   1. 忘记在 Pass 1 之后 bindFramebuffer(null) —— 结果什么都没显示
+ *   2. FBO 不重建 —— 拖窗口后画面拉伸/残留
+ *   3. 纹理 wrap 用了 REPEAT 且尺寸 NPOT —— 采样出现黑边
+ *   4. 忘记深度附件 —— 3D 场景穿模（本课已处理）
+ *   5. 后处理 pass 忘了 disable(DEPTH_TEST) —— 被上一帧深度挡住
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>

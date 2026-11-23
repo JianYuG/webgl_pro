@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08C · 六面独立纹理：多材质立方体</title>
+<!--
+  ============================================================
+  第 08C 课（专题）：立方体的 6 个面，各自贴不同的图
+  ------------------------------------------------------------
+  第 08B 课解决「一张图怎么贴上来」。这一课解决真实需求：
+  「六个面想贴六张不同的图」（比如做骰子、贴图集前的原型）。
+
+  本课新知识点：
+    1. 一个物体 ≠ 一次 draw call：
+       6 个面各自绑定自己的纹理，分 6 次绘制 ——
+       每次改变 GL 状态（绑纹理）之间夹一次 drawElements。
+    2. drawElements 的第 4 个参数是「字节偏移」：
+       每个面的 6 个索引在索引缓冲里是连续的，
+       所以画第 f 个面 = drawElements(..., 6, ..., f*6*2)。
+    3. 多纹理对象管理：创建 6 个 WebGLTexture，各自上传/设参数，
+       绘制时用 bindTexture 切换（都绑在 0 号纹理单元上即可）。
+    4. 生产环境提示：每面一次 draw call 是最直观的写法，
+       真实引擎会把 6 张图拼进一张「纹理图集」（第 23 课的思路），
+       一次 draw call 画完 —— 见文末注释。
+
+  操作方式：
+    · 右上面板先点一个面（比如「前」），再拖图片进窗口 / 选图
+    · 也可以点示例图按钮，把砖墙/木纹贴到选中的面上
+    · 「应用到全部面」把最后一张图铺满六个面
+    · 选中面在 3D 里会微微提亮，方便确认
+  ============================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #0b0e14; color: #e6edf3;
+    font: 14px/1.65 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .hud {
+    position: fixed; left: 18px; top: 18px; max-width: min(430px, calc(100vw - 36px));
+    padding: 14px 16px; border-radius: 12px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.74);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  }
+  .hud .step { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #58a6ff; }
+  .hud h1 { font-size: 15px; margin: 8px 0 6px; font-weight: 600; }
+  .hud p { font-size: 12.5px; color: #98a4b3; }
+  .hud .tip { margin-top: 9px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10); font-size: 12px; color: #7ee787; }
+  code { font-family: ui-monospace, Consolas, monospace; color: #ffa657; }
+
+  .panel {
+    position: fixed; right: 18px; top: 18px; width: 252px;
+    padding: 13px 14px; border-radius: 12px;
+    border: 1px solid rgba(255,255,255,.09); background: rgba(13,17,23,.78);
+    backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+    font-size: 12.5px; max-height: calc(100vh - 36px); overflow: auto;
+  }
+  .panel h2 { font: 600 11px/1 ui-monospace, Consolas, monospace; letter-spacing: 1.4px; color: #7ee787; margin: 12px 0 8px; }
+  .panel h2:first-child { margin-top: 0; }
+
+  /* 六个面的选择网格 */
+  .faces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .faceBtn {
+    cursor: pointer; text-align: center; padding: 6px 2px 5px;
+    background: #1a2433; border: 1px solid rgba(255,255,255,.14);
+    border-radius: 8px; color: #e6edf3;
+  }
+  .faceBtn b   { display: block; font-size: 13px; font-weight: 600; }
+  .faceBtn i   { display: block; font: 500 10px/1.3 ui-monospace, Consolas, monospace; font-style: normal; color: #8b98a8; margin-top: 2px; }
+  .faceBtn:hover { border-color: rgba(255,255,255,.28); }
+  .faceBtn.sel { background: #1d3a5f; border-color: #58a6ff; }
+  .faceBtn.custom i { color: #7ee787; }   /* 已贴上图的面，来源文字变绿 */
+
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; }
+  .row label { color: #98a4b3; flex: none; }
+  .row select {
+    flex: 1; max-width: 130px; background: #161d29; color: #e6edf3;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 6px; padding: 3px 6px; font-size: 12px;
+  }
+  .row input[type=range] { flex: 1; max-width: 110px; accent-color: #58a6ff; }
+  .row .val { font: 500 11px/1 ui-monospace, Consolas, monospace; color: #ffa657; }
+
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .btns button {
+    flex: 1 1 auto; cursor: pointer; font: 500 12px/1.4 inherit; color: #e6edf3;
+    background: #1a2433; border: 1px solid rgba(255,255,255,.14);
+    border-radius: 7px; padding: 6px 9px;
+  }
+  .btns button:hover { background: #223046; border-color: rgba(88,166,255,.5); }
+  #fileInput { display: none; }
+  #status {
+    margin-top: 10px; padding-top: 9px; border-top: 1px dashed rgba(255,255,255,.10);
+    font: 500 11px/1.55 ui-monospace, Consolas, monospace; color: #8b98a8;
+    word-break: break-all;
+  }
+  #status.err { color: #ff7b72; }
+  #status.ok  { color: #7ee787; }
+
+  #dropHint {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: rgba(88,166,255,.10); border: 2px dashed rgba(88,166,255,.55);
+    font: 600 20px/1 ui-sans-serif, system-ui; color: #cfe3ff; z-index: 9;
+  }
+  #dropHint.show { display: grid; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<div class="hud">
+  <div class="step">LESSON 08C</div>
+  <h1>六面独立纹理：多材质立方体</h1>
+  <p>每个面一个纹理对象，分 6 次 draw call 绘制。先在右上选一个面，再给它换图。</p>
+  <div class="tip">
+    选中面会微微提亮。骰子、宝箱这类「多贴图物体」原型就是这么搭的；
+    规模变大后要换成纹理图集（见文末注释）。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>PICK A FACE</h2>
+  <div class="faces" id="faceGrid"></div>
+
+  <h2>LOAD IMAGE</h2>
+  <div class="btns">
+    <button id="pickBtn">选择图片…</button>
+    <button id="applyAll">应用到全部面</button>
+    <button data-src="assets/brick.png">砖墙</button>
+    <button data-src="assets/wood.png">木纹</button>
+    <button data-src="assets/uv-grid.png">UV 校准</button>
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+
+  <h2>SAMPLER</h2>
+  <div class="row"><label>缩小过滤</label>
+    <select id="minFilter">
+      <option value="mipmap" selected>LINEAR_MIPMAP_LINEAR</option>
+      <option value="linear">LINEAR</option>
+      <option value="nearest">NEAREST</option>
+    </select>
+  </div>
+  <div class="row"><label>环绕模式</label>
+    <select id="wrap">
+      <option value="repeat" selected>REPEAT</option>
+      <option value="mirror">MIRRORED_REPEAT</option>
+      <option value="clamp">CLAMP_TO_EDGE</option>
+    </select>
+  </div>
+  <div class="row"><label>UV 平铺</label>
+    <input id="tiling" type="range" min="1" max="8" step="1" value="1">
+    <span class="val" id="tilingVal">1</span>
+  </div>
+  <div class="row"><label>翻转 Y 轴</label>
+    <input id="flipY" type="checkbox" checked>
+  </div>
+
+  <div id="status"></div>
+</div>
+
+<div id="dropHint">松开鼠标，贴到选中的面上</div>
+
+<script>
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+/* ==================================================================
+ * 矩阵库（同第 8 课）
+ * ================================================================== */
+const M4 = {
+  identity: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+    return o;
+  },
+  chain: (...ms) => ms.reduce((a, m) => M4.mul(a, m), M4.identity()),
+  rotateX(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
+  },
+  rotateY(rad) {
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
+  },
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    return new Float32Array([
+      f/aspect,0,0,0, 0,f,0,0,
+      0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0
+    ]);
+  },
+  lookAt(eye, center, up) {
+    const sub = (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const norm = a => { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+    const z = norm(sub(eye, center));
+    const x = norm(cross(up, z));
+    const y = cross(z, x);
+    return new Float32Array([
+      x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye), -dot(y,eye), -dot(z,eye), 1
+    ]);
+  }
+};
+
+/* ==================================================================
+ * 着色器：在 08B 的基础上加了 uBoost（选中面提亮）
+ * ================================================================== */
+const VERT_SRC = `
+  attribute vec3 aPos;
+  attribute vec2 aUv;
+  attribute float aShade;
+
+  varying vec2 vUv;
+  varying float vShade;
+
+  uniform mat4 uMvp;
+  uniform float uTiling;
+
+  void main() {
+    gl_Position = uMvp * vec4(aPos, 1.0);
+    vUv = aUv * uTiling;
+    vShade = aShade;
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+
+  varying vec2 vUv;
+  varying float vShade;
+  uniform sampler2D uTex;
+  uniform float uBoost;   // 选中面 >1，其余 =1
+
+  void main() {
+    vec4 tex = texture2D(uTex, vUv);
+    gl_FragColor = vec4(tex.rgb * vShade * uBoost, tex.a);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error('着色器编译失败:\n' + log);
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+const program = createProgram(VERT_SRC, FRAG_SRC);
+gl.useProgram(program);
+
+/* ==================================================================
+ * 六个面的定义：几何（同 08B）+ 名字 + 兜底纹理的色调
+ * 注意：这里用数组下标显式取值，避免 08B 踩过的解构坑
+ * ================================================================== */
+const FACES = [
+  { name: '前', axis: '+Z', hue: [47, 130, 255], shade: 1.00,
+    corners: [[-1,-1, 1], [ 1,-1, 1], [ 1, 1, 1], [-1, 1, 1]] },
+  { name: '后', axis: '-Z', hue: [188, 110, 255], shade: 0.45,
+    corners: [[ 1,-1,-1], [-1,-1,-1], [-1, 1,-1], [ 1, 1,-1]] },
+  { name: '右', axis: '+X', hue: [110, 230, 130], shade: 0.80,
+    corners: [[ 1,-1, 1], [ 1,-1,-1], [ 1, 1,-1], [ 1, 1, 1]] },
+  { name: '左', axis: '-X', hue: [255, 190, 70], shade: 0.62,
+    corners: [[-1,-1,-1], [-1,-1, 1], [-1, 1, 1], [-1, 1,-1]] },
+  { name: '上', axis: '+Y', hue: [80, 220, 230], shade: 0.92,
+    corners: [[-1, 1, 1], [ 1, 1, 1], [ 1, 1,-1], [-1, 1,-1]] },
+  { name: '下', axis: '-Y', hue: [255, 120, 170], shade: 0.38,
+    corners: [[-1,-1,-1], [ 1,-1,-1], [ 1,-1, 1], [-1,-1, 1]] }
+];
+
+const vertexData = [];
+const indexData  = [];
+const UV = [[0,0], [1,0], [1,1], [0,1]];
+
+FACES.forEach((face, f) => {
+  const cs = face.corners;                 // 显式取值，不玩解构
+  cs.forEach((p, i) => {
+    vertexData.push(p[0], p[1], p[2], UV[i][0], UV[i][1], face.shade);
+  });
+  // 关键布局：每个面的 6 个索引是「连续的 6 个」
+  // —— 这样才能用字节偏移单独画出某个面
+  const base = f * 4;
+  indexData.push(base, base + 1, base + 2, base, base + 2, base + 3);
+});
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertexData), gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indexData), gl.STATIC_DRAW);
+
+const STRIDE = 6 * 4;
+function bindAttrib(name, size, offsetFloats) {
+  const loc = gl.getAttribLocation(program, name);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, STRIDE, offsetFloats * 4);
+}
+bindAttrib('aPos',   3, 0);
+bindAttrib('aUv',    2, 3);
+bindAttrib('aShade', 1, 5);
+
+const uMvpLoc    = gl.getUniformLocation(program, 'uMvp');
+const uTilingLoc = gl.getUniformLocation(program, 'uTiling');
+const uTexLoc    = gl.getUniformLocation(program, 'uTex');
+const uBoostLoc  = gl.getUniformLocation(program, 'uBoost');
+
+/* ==================================================================
+ * 多纹理管理：每个面一个 WebGLTexture + 一个像素源引用
+ * ------------------------------------------------------------------
+ * 纹理对象本身没有「属于哪个面」的概念，是我们约定 faceTex[f]
+ * 只在画第 f 面时绑定。都绑在 0 号纹理单元上（每帧切换绑定）。
+ * ================================================================== */
+const anisotropic =
+    gl.getExtension('EXT_texture_filter_anisotropic')
+ || gl.getExtension('WEBGL_EXT_texture_filter_anisotropic');
+
+const faceTex = FACES.map(() => ({
+  tex: gl.createTexture(),
+  source: null,        // 像素源（canvas/img），翻转 Y 改动时重新上传要用
+  label: '内置'
+}));
+
+let selectedFace = 0;         // 当前选中的面
+let lastSource = null;        // 最后一次成功加载的图（「应用到全部面」用）
+let lastLabel = '';
+
+const isPOT = (n) => (n & (n - 1)) === 0;
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+/* 把采样参数（wrap/filter/各向异性）应用到某一个纹理上 */
+function applyParamsToTexture(tex) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  const wrapMap = { repeat: gl.REPEAT, mirror: gl.MIRRORED_REPEAT, clamp: gl.CLAMP_TO_EDGE };
+  const wrap = wrapMap[document.getElementById('wrap').value];
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  const minMap = { mipmap: gl.LINEAR_MIPMAP_LINEAR, linear: gl.LINEAR, nearest: gl.NEAREST };
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minMap[document.getElementById('minFilter').value]);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  if (anisotropic) {
+    const max = gl.getParameter(anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+    gl.texParameterf(gl.TEXTURE_2D, anisotropic.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, max));
+  }
+}
+
+/* 核心：把像素源上传到第 f 面的纹理（NPOT 自动重采样到 512²） */
+function uploadToFace(f, source, label) {
+  const t = faceTex[f];
+  let src = source;
+  const w = source.width, h = source.height;
+  if (!(isPOT(w) && isPOT(h))) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 512;
+    c.getContext('2d').drawImage(source, 0, 0, 512, 512);
+    src = c;
+    label += ` · ${w}×${h}→512²`;
+  } else {
+    label += ` · ${w}×${h}`;
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, t.tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, document.getElementById('flipY').checked);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  applyParamsToTexture(t.tex);
+  gl.generateMipmap(gl.TEXTURE_2D);
+
+  t.source = source;
+  t.label = label;
+}
+
+/* ==================================================================
+ * 兜底纹理：每个面一张不同色调的棋盘格，写上「前 +Z」等字样
+ * —— 顺便当方向指示器：字倒着说明贴图上下颠倒了
+ * ================================================================== */
+function makeFaceFallback(face) {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  const [r, g, b] = face.hue;
+
+  const cell = 32;
+  for (let y = 0; y < S / cell; y++)
+    for (let x = 0; x < S / cell; x++) {
+      ctx.fillStyle = (x + y) % 2
+        ? `rgb(${r*0.16|0},${g*0.16|0},${b*0.16|0})`
+        : `rgb(${r*0.30|0},${g*0.30|0},${b*0.30|0})`;
+      ctx.fillRect(x * cell, y * cell, cell, cell);
+    }
+
+  ctx.strokeStyle = `rgba(${r},${g},${b},0.95)`;
+  ctx.lineWidth = 6;
+  ctx.strokeRect(6, 6, S - 12, S - 12);
+
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.font = 'bold 64px ui-sans-serif, "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(face.name, S / 2, S / 2 + 10);
+  ctx.font = 'bold 30px ui-monospace, Consolas, monospace';
+  ctx.fillText(face.axis, S / 2, S / 2 + 54);
+
+  ctx.fillStyle = '#7ee787';
+  ctx.fillRect(8, 8, 24, 24);
+  return c;
+}
+
+gl.activeTexture(gl.TEXTURE0);
+gl.uniform1i(uTexLoc, 0);
+FACES.forEach((face, f) => {
+  const fb = makeFaceFallback(face);
+  uploadToFace(f, fb, '内置');
+});
+
+/* ==================================================================
+ * UI：六个面的按钮
+ * ================================================================== */
+const faceGrid = document.getElementById('faceGrid');
+FACES.forEach((face, f) => {
+  const btn = document.createElement('button');
+  btn.className = 'faceBtn';
+  btn.innerHTML = `<b>${face.name}</b><i>${face.axis}</i>`;
+  btn.addEventListener('click', () => selectFace(f));
+  faceGrid.appendChild(btn);
+});
+
+function refreshFaceButtons() {
+  faceGrid.querySelectorAll('.faceBtn').forEach((btn, f) => {
+    btn.classList.toggle('sel', f === selectedFace);
+    btn.classList.toggle('custom', faceTex[f].label !== '内置');
+    btn.querySelector('i').textContent =
+      faceTex[f].label === '内置' ? face.axis : faceTex[f].label.split(' · ')[0];
+  });
+  setStatus(`选中面：${FACES[selectedFace].name}（${FACES[selectedFace].axis}）· 来源：${faceTex[selectedFace].label}`, 'ok');
+}
+
+function selectFace(f) {
+  selectedFace = f;
+  refreshFaceButtons();
+}
+
+/* ==================================================================
+ * 图片来源：File API（选择 / 拖拽）→ 贴到选中的面
+ * ================================================================== */
+function loadFileToFace(file, f) {
+  if (!file || !file.type.startsWith('image/')) {
+    setStatus('这不是图片文件：' + (file ? file.type || file.name : '未知'), 'err');
+    return;
+  }
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    uploadToFace(f, img, `${file.name}`);
+    lastSource = img;
+    lastLabel = file.name;
+    refreshFaceButtons();
+    URL.revokeObjectURL(url);
+  };
+  img.onerror = () => { setStatus('图片解码失败：' + file.name, 'err'); URL.revokeObjectURL(url); };
+  img.src = url;
+}
+
+document.getElementById('pickBtn').addEventListener('click', () => {
+  document.getElementById('fileInput').click();
+});
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  loadFileToFace(e.target.files[0], selectedFace);
+  e.target.value = '';
+});
+
+const dropHint = document.getElementById('dropHint');
+window.addEventListener('dragover', (e) => { e.preventDefault(); dropHint.classList.add('show'); });
+window.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget === null) dropHint.classList.remove('show');
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropHint.classList.remove('show');
+  loadFileToFace(e.dataTransfer.files[0], selectedFace);
+});
+
+/* ==================================================================
+ * 示例图（相对路径，需要 http 服务器；file:// 下捕获跨域错误）
+ * ================================================================== */
+function loadExampleToFace(src, f) {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      uploadToFace(f, img, src);
+      lastSource = img;
+      lastLabel = src;
+      refreshFaceButtons();
+    } catch (err) {
+      setStatus(`「${src}」像素被跨域策略拦截（${err.name}）。双击打开时请改用拖拽/选图，或运行 python -m http.server 8000。`, 'err');
+    }
+  };
+  img.onerror = () => {
+    setStatus(`找不到 ${src} —— 双击 file:// 时请用「选择图片」或拖拽。`, 'err');
+  };
+  img.src = src;
+}
+document.querySelectorAll('.panel button[data-src]').forEach((btn) => {
+  btn.addEventListener('click', () => loadExampleToFace(btn.dataset.src, selectedFace));
+});
+
+/* 应用到全部面：把最后加载的图铺满 6 个面 */
+document.getElementById('applyAll').addEventListener('click', () => {
+  if (!lastSource) { setStatus('还没有加载过任何图片，先拖一张或点示例图。', 'err'); return; }
+  FACES.forEach((_, f) => uploadToFace(f, lastSource, lastLabel));
+  refreshFaceButtons();
+});
+
+/* ==================================================================
+ * 采样参数 / 翻转 Y 的全局控件
+ * ================================================================== */
+document.getElementById('minFilter').addEventListener('change', () => {
+  faceTex.forEach((t) => applyParamsToTexture(t.tex));
+});
+document.getElementById('wrap').addEventListener('change', () => {
+  faceTex.forEach((t) => applyParamsToTexture(t.tex));
+});
+document.getElementById('tiling').addEventListener('input', (e) => {
+  document.getElementById('tilingVal').textContent = e.target.value;
+});
+document.getElementById('flipY').addEventListener('change', () => {
+  // 翻转影响「上传那一刻」，所有面都要重新上传
+  FACES.forEach((_, f) => {
+    const t = faceTex[f];
+    if (t.source) uploadToFace(f, t.source, t.label.replace(/ · .*$/, ''));
+  });
+  refreshFaceButtons();
+});
+
+refreshFaceButtons();
+
+/* ==================================================================
+ * 渲染循环：6 次 draw call，每次绑定该面的纹理
+ * ================================================================== */
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width === w && canvas.height === h) return;
+  canvas.width = w; canvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+
+let last = null, clock = 0;
+
+function render(now) {
+  if (last === null) last = now;
+  clock += Math.min((now - last) / 1000, 0.1);
+  last = now;
+  const t = clock;
+
+  resize();
+  gl.clearColor(0.045, 0.055, 0.078, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  const aspect = canvas.clientWidth / canvas.clientHeight;
+  const proj = M4.perspective(60 * Math.PI / 180, aspect, 0.1, 100);
+  const view = M4.lookAt([0, 1.2, 4.6], [0, 0, 0], [0, 1, 0]);
+  const model = M4.chain(M4.rotateY(t * 0.5), M4.rotateX(t * 0.32));
+  gl.uniformMatrix4fv(uMvpLoc, false, M4.chain(proj, view, model));
+  gl.uniform1f(uTilingLoc, +document.getElementById('tiling').value);
+
+  /* ---- 每个面一次绘制 ----
+   * drawElements(mode, count, type, offset) 的 offset 单位是「字节」。
+   * 每面 6 个 UNSIGNED_SHORT 索引 = 12 字节，所以第 f 面的偏移是 f*12。
+   * 每次绘制前把该面的纹理绑到 0 号单元。
+   */
+  for (let f = 0; f < FACES.length; f++) {
+    gl.bindTexture(gl.TEXTURE_2D, faceTex[f].tex);
+    gl.uniform1f(uBoostLoc, f === selectedFace ? 1.30 : 1.0);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, f * 6 * 2);
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+/* ------------------------------------------------------------------
+ * 6 次 draw call vs 纹理图集：
+ *
+ * 本课写法（每面一次绘制）直观、好维护，缺点是 draw call 变多。
+ * 一个骰子 6 次、一百个骰子就是 600 次 —— GPU 提交开销会成为瓶颈。
+ *
+ * 生产做法是「纹理图集 / atlas」：把 6 张图拼进一张大图，
+ * 每个面的 UV 映射到图集里各自的子区域，一次 draw call 画完。
+ * 第 23 课（文字渲染）里已经用过图集思想；配合第 11 课的实例化，
+ * 就能一次调用画出「每个实例 6 面各不相同」的骰子军团。
+ *
+ * 另外：WebGL 有 8~16 个纹理单元（MAX_COMBINED_TEXTURE_UNITS），
+ * 一次绘制最多能同时采样几张图。6 面各一张图超出单次 draw call
+ * 的采样数上限时，就必须走图集或多次绘制 —— 本课的多次绘制
+ * 正是「图集放不下时的兜底方案」。
+ * ------------------------------------------------------------------ */
+</script>
+</body>
+</html>
